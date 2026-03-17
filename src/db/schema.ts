@@ -1,45 +1,9 @@
-/**
- * VentureHub — Production-Grade Database Schema
- * -----------------------------------------------
- * Design principles applied:
- *
- *  1. FK INDEXES         — Every FK column has a dedicated index. PostgreSQL does NOT
- *                          auto-create them. Missing FK indexes = sequential scans on
- *                          every JOIN → high CPU on any relational query.
- *
- *  2. COMPOSITE INDEXES  — Column order matters. Most selective (highest cardinality)
- *                          column goes first. Covers exact WHERE + ORDER BY patterns
- *                          of hot API queries to enable index-only scans.
- *
- *  3. PARTIAL INDEXES    — Index only rows that matter (unread notifications, active
- *                          users, pending EOIs). Smaller index = faster lookup + less
- *                          RAM consumed by the shared buffer cache.
- *
- *  4. DENORM COUNTERS    — profileViewCount, eoiReceivedCount etc. are updated via
- *                          atomic increments (UPDATE … SET col = col + 1). Avoids
- *                          expensive COUNT(*) GROUP BY on every dashboard render.
- *
- *  5. NATIVE ENUMS       — Stored as 4-byte OIDs vs varchar. Faster comparison,
- *                          less storage, constraint enforced at DB level (no app check).
- *
- *  6. DECIMAL for money  — Never FLOAT for currency. DECIMAL(15,2) is exact arithmetic.
- *
- *  7. APPEND-ONLY TABLES — analytics_events and admin_actions are INSERT-only.
- *                          Enables future range partitioning by month (pg_partman).
- *
- *  8. DRIZZLE RELATIONS  — Declared separately. Used by db.query.* for type-safe
- *                          eager loading. Zero N+1 risk. Relations do NOT create DB
- *                          constraints — .references() handles that.
- *
- *  9. TYPE EXPORTS       — $inferSelect / $inferInsert gives TypeScript types directly
- *                          from table definitions — single source of truth.
- */
-
 import {
   boolean,
   decimal,
   index,
   integer,
+  jsonb,
   pgEnum,
   pgTable,
   text,
@@ -154,9 +118,68 @@ export const NotificationEvent = pgEnum("notification_event", [
   "PROFILE_SUSPENDED",
 ]);
 
+export const DisputeStatus = pgEnum("dispute_status", [
+  "OPEN",
+  "UNDER_REVIEW",
+  "RESOLVED",
+  "CLOSED",
+]);
+
+export const ApplicationStatus = pgEnum("application_status", [
+  "SUBMITTED",
+  "UNDER_REVIEW",
+  "APPROVED",
+  "REJECTED",
+]);
+
+// =====================================================================
+// STARTUP APPLICATIONS
+// Pre-user state. Admin reviews → on approval, system creates user +
+// startup_profile + activation token. Row is kept as audit trail.
+// =====================================================================
+
+export const StartupApplicationsTable = pgTable(
+  "startup_applications",
+  {
+    id: uuid("id").defaultRandom().primaryKey().notNull(),
+
+    // Contact info (no account yet)
+    founderName: text("founder_name").notNull(),
+    email: text("email").notNull(),
+    mobile: text("mobile"),
+    companyName: text("company_name").notNull(),
+    websiteUrl: text("website_url"),
+    sector: text("sector").notNull(),
+    stage: FundingStage("stage").notNull(),
+    country: text("country"),
+    description: text("description"),
+    pitchDeckUrl: text("pitch_deck_url"),
+
+    status: ApplicationStatus("status").default("SUBMITTED").notNull(),
+    reviewedBy: uuid("reviewed_by"), // FK to users set after user exists
+    reviewNotes: text("review_notes"),
+    reviewedAt: timestamp("reviewed_at", { mode: "date" }),
+
+    // Set when admin approves — links application to created user
+    createdUserId: uuid("created_user_id"),
+
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+    updatedAt: timestamp("updated_at").defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex("startup_applications_email_key").on(t.email),
+    // Admin review queue
+    index("startup_applications_status_created_at_idx").on(
+      t.status,
+      t.createdAt
+    ),
+  ]
+);
+
 // =====================================================================
 // USERS
-// Central auth entity. Role-specific data in separate profile tables.
+// Pure auth + identity. Role-specific data lives in profile tables.
+// approval_status removed — profiles carry their own approval lifecycle.
 // =====================================================================
 
 export const UsersTable = pgTable(
@@ -170,12 +193,6 @@ export const UsersTable = pgTable(
     mobile: text("mobile"),
     role: UserRole("role").notNull(),
 
-    // Admin-controlled governance
-    approvalStatus: ApprovalStatus("approval_status")
-      .default("PENDING")
-      .notNull(),
-    suspensionReason: text("suspension_reason"),
-
     avatarUrl: text("avatar_url"),
     isActive: boolean("is_active").default(true).notNull(),
     lastLoginAt: timestamp("last_login_at", { mode: "date" }),
@@ -185,17 +202,18 @@ export const UsersTable = pgTable(
   },
   (t) => [
     uniqueIndex("users_email_key").on(t.email),
-    // Admin search: name, email, mobile
-    index("users_name_email_mobile_idx").on(t.name, t.email, t.mobile),
-    // Admin approval queue: WHERE role = X AND approval_status = 'PENDING'
-    index("users_role_approval_status_idx").on(t.role, t.approvalStatus),
-    // Most queries filter active users — partial index keeps it small
+    // Admin search by name / email
+    index("users_name_idx").on(t.name),
+    // Role-based queries (list all investors, etc.)
+    index("users_role_idx").on(t.role),
+    // Session validation — only active users
     index("users_active_idx").on(t.isActive).where(sql`is_active = true`),
   ]
 );
 
 // =====================================================================
-// AUTH TOKENS
+// AUTH TOKENS — two separate tables, each with a single responsibility
+// Expiry checked at app layer; expired rows cleaned by a nightly cron.
 // =====================================================================
 
 export const EmailVerificationTokenTable = pgTable(
@@ -231,6 +249,12 @@ export const PasswordResetTokenTable = pgTable(
 
 // =====================================================================
 // STARTUP PROFILE
+// approval_status lives here, not on users.
+// founders inlined as JSONB — always fetched together, never queried
+// individually. Eliminates a JOIN on every profile page load.
+//
+// founders JSONB shape:
+// [{ name, role, bio, linkedinUrl, avatarUrl, isLeadFounder }]
 // =====================================================================
 
 export const StartupProfilesTable = pgTable(
@@ -242,24 +266,38 @@ export const StartupProfilesTable = pgTable(
       .unique()
       .references(() => UsersTable.id, { onDelete: "cascade" }),
 
+    // Admin governance (moved from users table)
+    approvalStatus: ApprovalStatus("approval_status")
+      .default("PENDING")
+      .notNull(),
+    suspensionReason: text("suspension_reason"),
+    isVerified: boolean("is_verified").default(false).notNull(),
+    verifiedAt: timestamp("verified_at", { mode: "date" }),
+    verifiedBy: uuid("verified_by").references(() => UsersTable.id),
+    isFeatured: boolean("is_featured").default(false).notNull(),
+    featuredUntil: timestamp("featured_until", { mode: "date" }),
+    profileScore: integer("profile_score").default(0).notNull(),
+
     // Identity
     companyName: text("company_name").notNull(),
     tagline: text("tagline"),
     description: text("description"),
     logoUrl: text("logo_url"),
     websiteUrl: text("website_url"),
-
-    // Geography
     country: text("country"),
     city: text("city"),
 
-    // Classification — used in investor search filters
+    // Classification
     sector: text("sector").notNull(),
     industry: text("industry"),
     stage: FundingStage("stage").notNull(),
     foundedYear: integer("founded_year"),
 
-    // Pitch content
+    // Founders inlined — no JOIN needed on profile load
+    // Shape: [{ name, role, bio, linkedinUrl, avatarUrl, isLeadFounder }]
+    founders: jsonb("founders").default([]).notNull(),
+
+    // Pitch
     problemStatement: text("problem_statement"),
     solutionDescription: text("solution_description"),
     businessModel: text("business_model"),
@@ -284,20 +322,11 @@ export const StartupProfilesTable = pgTable(
       scale: 2,
     }),
 
-    // Impact layer
+    // Impact
     impactDescription: text("impact_description"),
-    impactMetrics: text("impact_metrics"),
-    sdgGoals: text("sdg_goals"), // "3,7,13" — comma-separated
+    sdgGoals: jsonb("sdg_goals").default([]).notNull(), // [3, 7, 13]
 
-    // Admin-controlled verification & featuring
-    isVerified: boolean("is_verified").default(false).notNull(),
-    verifiedAt: timestamp("verified_at", { mode: "date" }),
-    verifiedBy: uuid("verified_by").references(() => UsersTable.id),
-    profileScore: integer("profile_score").default(0).notNull(),
-    isFeatured: boolean("is_featured").default(false).notNull(),
-    featuredUntil: timestamp("featured_until", { mode: "date" }),
-
-    // Denormalized counters — atomic increment, never COUNT(*)
+    // Denormalized counters — atomic UPDATE col = col + 1, never COUNT(*)
     profileViewCount: integer("profile_view_count").default(0).notNull(),
     eoiReceivedCount: integer("eoi_received_count").default(0).notNull(),
     watchlistCount: integer("watchlist_count").default(0).notNull(),
@@ -306,51 +335,39 @@ export const StartupProfilesTable = pgTable(
     updatedAt: timestamp("updated_at").defaultNow().notNull(),
   },
   (t) => [
-    // Hot investor search: sector + stage + country (selectivity order)
+    // Hot investor search: sector + stage + country
     index("startup_profiles_sector_stage_country_idx").on(
       t.sector,
       t.stage,
       t.country
     ),
-    // Funding range slider filter
+    // Approval queue
+    index("startup_profiles_approval_status_idx").on(t.approvalStatus),
+    // Funding range slider
     index("startup_profiles_funding_ask_idx").on(
       t.fundingAskMin,
       t.fundingAskMax
     ),
-    // Featured page — partial index (only ~N rows, stays tiny)
+    // Featured page — partial (only ~N rows, stays tiny)
     index("startup_profiles_featured_idx")
-      .on(t.isFeatured, t.featuredUntil)
+      .on(t.featuredUntil)
       .where(sql`is_featured = true`),
-    // Verified badge filter
+    // Verified badge filter — partial
     index("startup_profiles_verified_idx")
       .on(t.isVerified)
       .where(sql`is_verified = true`),
     // Leaderboard / recommendation sort
     index("startup_profiles_score_idx").on(t.profileScore),
+    // Visibility gate: approved + score threshold check
+    index("startup_profiles_approved_score_idx").on(
+      t.approvalStatus,
+      t.profileScore
+    ),
   ]
 );
 
-export const StartupFoundersTable = pgTable(
-  "startup_founders",
-  {
-    id: uuid("id").defaultRandom().primaryKey().notNull(),
-    startupId: uuid("startup_id")
-      .notNull()
-      .references(() => StartupProfilesTable.id, { onDelete: "cascade" }),
-    name: text("name").notNull(),
-    role: text("role").notNull(), // "CEO" | "CTO" | "COO"
-    bio: text("bio"),
-    linkedinUrl: text("linkedin_url"),
-    avatarUrl: text("avatar_url"),
-    isLeadFounder: boolean("is_lead_founder").default(false).notNull(),
-    createdAt: timestamp("created_at").defaultNow().notNull(),
-  },
-  (t) => [
-    // FK index — JOINed on every startup profile page load
-    index("startup_founders_startup_id_idx").on(t.startupId),
-  ]
-);
-
+// Documents kept as separate table — individual access control (isPublic)
+// and potential per-document actions (delete, replace) justify the table.
 export const StartupDocumentsTable = pgTable(
   "startup_documents",
   {
@@ -358,13 +375,13 @@ export const StartupDocumentsTable = pgTable(
     startupId: uuid("startup_id")
       .notNull()
       .references(() => StartupProfilesTable.id, { onDelete: "cascade" }),
-    // "PITCH_DECK" | "FINANCIALS" | "LEGAL" | "OTHER"
     documentType: text("document_type").notNull(),
+    // "PITCH_DECK" | "FINANCIALS" | "LEGAL" | "OTHER"
     title: text("title").notNull(),
     fileUrl: text("file_url").notNull(),
     fileSize: integer("file_size"),
     mimeType: text("mime_type"),
-    // false = locked until EOI accepted; true = visible pre-EOI
+    // false = locked until EOI accepted
     isPublic: boolean("is_public").default(false).notNull(),
     uploadedAt: timestamp("uploaded_at").defaultNow().notNull(),
   },
@@ -375,6 +392,8 @@ export const StartupDocumentsTable = pgTable(
 
 // =====================================================================
 // INVESTOR PROFILE
+// preferredSectors / preferredStages / preferredGeographies → jsonb[]
+// Enables GIN index for @> containment used by matching algorithm.
 // =====================================================================
 
 export const InvestorProfilesTable = pgTable(
@@ -386,55 +405,71 @@ export const InvestorProfilesTable = pgTable(
       .unique()
       .references(() => UsersTable.id, { onDelete: "cascade" }),
 
+    // Admin governance
+    approvalStatus: ApprovalStatus("approval_status")
+      .default("PENDING")
+      .notNull(),
+    suspensionReason: text("suspension_reason"),
+    isVerified: boolean("is_verified").default(false).notNull(),
+    verifiedAt: timestamp("verified_at", { mode: "date" }),
+    verifiedBy: uuid("verified_by").references(() => UsersTable.id),
+
     firmName: text("firm_name"),
     designation: text("designation"),
     bio: text("bio"),
-    avatarUrl: text("avatar_url"),
     websiteUrl: text("website_url"),
     linkedinUrl: text("linkedin_url"),
     country: text("country"),
     city: text("city"),
 
-    // Preferences — used by matching algorithm
+    // Preferences — jsonb arrays replace comma-delimited text
+    // Enables: WHERE preferred_sectors @> '["Fintech"]'
     investorType: InvestorType("investor_type"),
-    preferredSectors: text("preferred_sectors"),      // "Climatetech,AgriTech"
-    preferredStages: text("preferred_stages"),        // "SEED,SERIES_A"
-    preferredGeographies: text("preferred_geographies"),
+    preferredSectors: jsonb("preferred_sectors").default([]).notNull(),
+    preferredStages: jsonb("preferred_stages").default([]).notNull(),
+    preferredGeographies: jsonb("preferred_geographies").default([]).notNull(),
     ticketSizeMin: decimal("ticket_size_min", { precision: 15, scale: 2 }),
     ticketSizeMax: decimal("ticket_size_max", { precision: 15, scale: 2 }),
     investmentThesis: text("investment_thesis"),
     impactFocused: boolean("impact_focused").default(false).notNull(),
 
-    // Portfolio summary — denormalized for dashboard widget
+    // Portfolio summary — denormalized for dashboard
     totalInvestments: integer("total_investments").default(0).notNull(),
     totalPortfolioValue: decimal("total_portfolio_value", {
       precision: 18,
       scale: 2,
     }),
-    irr: decimal("irr", { precision: 5, scale: 2 }),
 
     membershipExpiresAt: timestamp("membership_expires_at", { mode: "date" }),
-    isVerified: boolean("is_verified").default(false).notNull(),
-    verifiedAt: timestamp("verified_at", { mode: "date" }),
-    verifiedBy: uuid("verified_by").references(() => UsersTable.id),
 
     createdAt: timestamp("created_at").defaultNow().notNull(),
     updatedAt: timestamp("updated_at").defaultNow().notNull(),
   },
   (t) => [
+    index("investor_profiles_approval_status_idx").on(t.approvalStatus),
     index("investor_profiles_type_idx").on(t.investorType),
     index("investor_profiles_verified_idx")
       .on(t.isVerified)
       .where(sql`is_verified = true`),
-    // Membership renewal cron job queries expiring memberships
+    // Membership renewal cron
     index("investor_profiles_membership_expires_idx").on(
       t.membershipExpiresAt
+    ),
+    // GIN index — powers @> containment queries in matching algorithm
+    index("investor_profiles_sectors_gin_idx").using(
+      "gin",
+      t.preferredSectors
+    ),
+    index("investor_profiles_stages_gin_idx").using(
+      "gin",
+      t.preferredStages
     ),
   ]
 );
 
 // =====================================================================
 // MENTOR PROFILE
+// domains / industries → jsonb arrays (same GIN rationale as investor)
 // =====================================================================
 
 export const MentorProfilesTable = pgTable(
@@ -446,22 +481,33 @@ export const MentorProfilesTable = pgTable(
       .unique()
       .references(() => UsersTable.id, { onDelete: "cascade" }),
 
+    // Admin governance
+    approvalStatus: ApprovalStatus("approval_status")
+      .default("PENDING")
+      .notNull(),
+    suspensionReason: text("suspension_reason"),
+    isVerified: boolean("is_verified").default(false).notNull(),
+    verifiedAt: timestamp("verified_at", { mode: "date" }),
+    verifiedBy: uuid("verified_by").references(() => UsersTable.id),
+
     headline: text("headline"),
     bio: text("bio"),
-    avatarUrl: text("avatar_url"),
     linkedinUrl: text("linkedin_url"),
     websiteUrl: text("website_url"),
     country: text("country"),
     city: text("city"),
 
-    // Expertise
-    domains: text("domains"),           // "Product,Finance,Growth"
-    industries: text("industries"),
+    // Expertise — jsonb arrays replace comma-delimited text
+    domains: jsonb("domains").default([]).notNull(),
+    industries: jsonb("industries").default([]).notNull(),
     yearsOfExperience: integer("years_of_experience"),
     previousCompanies: text("previous_companies"),
 
     // Booking
-    sessionPriceUsd: decimal("session_price_usd", { precision: 10, scale: 2 }),
+    sessionPriceUsd: decimal("session_price_usd", {
+      precision: 10,
+      scale: 2,
+    }),
     sessionDurationMinutes: integer("session_duration_minutes").default(60),
     timezone: text("timezone"),
     isAvailable: boolean("is_available").default(true).notNull(),
@@ -475,25 +521,21 @@ export const MentorProfilesTable = pgTable(
       scale: 2,
     }).default("0"),
 
-    isVerified: boolean("is_verified").default(false).notNull(),
-    verifiedAt: timestamp("verified_at", { mode: "date" }),
-    verifiedBy: uuid("verified_by").references(() => UsersTable.id),
-
     createdAt: timestamp("created_at").defaultNow().notNull(),
     updatedAt: timestamp("updated_at").defaultNow().notNull(),
   },
   (t) => [
-    // Marketplace listing: available mentors sorted by rating
-    // Partial index — only available rows, keeps index tiny
+    index("mentor_profiles_approval_status_idx").on(t.approvalStatus),
+    // Marketplace listing: available mentors sorted by rating — partial
     index("mentor_profiles_available_rating_idx")
       .on(t.averageRating)
       .where(sql`is_available = true`),
-    // Price range filter
     index("mentor_profiles_price_idx").on(t.sessionPriceUsd),
-    index("mentor_profiles_domains_idx").on(t.domains),
     index("mentor_profiles_verified_idx")
       .on(t.isVerified)
       .where(sql`is_verified = true`),
+    // GIN index for domain/industry filtering
+    index("mentor_profiles_domains_gin_idx").using("gin", t.domains),
   ]
 );
 
@@ -511,18 +553,14 @@ export const MentorAvailabilityTable = pgTable(
     createdAt: timestamp("created_at").defaultNow().notNull(),
   },
   (t) => [
-    index("mentor_availability_mentor_id_idx").on(t.mentorId),
     // Calendar lookup: mentor + specific day
-    index("mentor_availability_mentor_day_idx").on(
-      t.mentorId,
-      t.dayOfWeek
-    ),
+    index("mentor_availability_mentor_day_idx").on(t.mentorId, t.dayOfWeek),
   ]
 );
 
 // =====================================================================
 // EOI — EXPRESSION OF INTEREST
-// Core investment workflow. Unlocks messaging on acceptance.
+// Unlocks messaging on acceptance. Core investment workflow.
 // =====================================================================
 
 export const EOITable = pgTable(
@@ -540,7 +578,6 @@ export const EOITable = pgTable(
     message: text("message"),
     rejectionReason: text("rejection_reason"),
 
-    // Deal progression tracking
     dealStage: DealStage("deal_stage").default("EOI_SENT").notNull(),
     proposedAmount: decimal("proposed_amount", { precision: 15, scale: 2 }),
     proposedEquity: decimal("proposed_equity", { precision: 5, scale: 2 }),
@@ -555,14 +592,11 @@ export const EOITable = pgTable(
   (t) => [
     // One EOI per investor+startup pair — enforced at DB level
     uniqueIndex("eois_investor_startup_key").on(t.investorId, t.startupId),
-    // Startup inbox: "EOIs I received" — startup + status filter
-    index("eois_startup_id_status_idx").on(t.startupId, t.status),
-    // Investor pipeline: "My sent EOIs" — investor + deal stage
-    index("eois_investor_id_deal_stage_idx").on(
-      t.investorId,
-      t.dealStage
-    ),
-    // Notification queue for pending EOIs
+    // Startup inbox: EOIs I received + status filter
+    index("eois_startup_status_idx").on(t.startupId, t.status),
+    // Investor pipeline: my sent EOIs + deal stage
+    index("eois_investor_deal_stage_idx").on(t.investorId, t.dealStage),
+    // Notification queue for pending EOIs — partial
     index("eois_pending_sent_at_idx")
       .on(t.sentAt)
       .where(sql`status = 'PENDING'`),
@@ -647,12 +681,12 @@ export const MessagesTable = pgTable(
     createdAt: timestamp("created_at").defaultNow().notNull(),
   },
   (t) => [
-    // Chat window: conversation + created_at DESC (pagination)
+    // Chat window: conversation + pagination by date
     index("messages_conversation_created_at_idx").on(
       t.conversationId,
       t.createdAt
     ),
-    // Unread count badge — partial index on unread rows only (fast, tiny)
+    // Unread count badge — partial, only unread rows
     index("messages_unread_idx")
       .on(t.conversationId, t.senderId)
       .where(sql`is_read = false`),
@@ -711,7 +745,7 @@ export const MentorSessionsTable = pgTable(
     ),
     // Startup dashboard: sessions I've booked + status filter
     index("mentor_sessions_startup_status_idx").on(t.startupId, t.status),
-    // Admin earnings report: completed sessions only
+    // Admin earnings report: completed sessions only — partial
     index("mentor_sessions_completed_idx")
       .on(t.completedAt)
       .where(sql`status = 'COMPLETED'`),
@@ -742,13 +776,16 @@ export const SessionRatingsTable = pgTable(
       t.sessionId,
       t.raterId
     ),
-    // Reputation query: all ratings WHERE rateeId = mentorProfile.userId
+    // Reputation query: all ratings for a given ratee
     index("session_ratings_ratee_id_idx").on(t.rateeId),
   ]
 );
 
 // =====================================================================
 // PAYMENTS (Razorpay)
+// Typed FKs replace polymorphic referenceType + referenceId strings.
+// Only one FK will be non-null per row (enforced via app-layer check).
+// DB gets referential integrity; queries get direct FK joins.
 // =====================================================================
 
 export const PaymentsTable = pgTable(
@@ -764,10 +801,18 @@ export const PaymentsTable = pgTable(
     amountUsd: decimal("amount_usd", { precision: 10, scale: 2 }).notNull(),
     currency: text("currency").default("USD").notNull(),
 
-    // Polymorphic: what was paid for
-    referenceId: uuid("reference_id"),
-    referenceType: text("reference_type"),
-    // "MENTOR_SESSION" | "STARTUP_REGISTRATION" | "INVESTOR_MEMBERSHIP"
+    // Typed FKs — exactly one is non-null per row
+    sessionId: uuid("session_id").references(() => MentorSessionsTable.id, {
+      onDelete: "set null",
+    }),
+    startupApplicationId: uuid("startup_application_id").references(
+      () => StartupApplicationsTable.id,
+      { onDelete: "set null" }
+    ),
+    investorProfileId: uuid("investor_profile_id").references(
+      () => InvestorProfilesTable.id,
+      { onDelete: "set null" }
+    ),
 
     // Razorpay lifecycle
     razorpayOrderId: text("razorpay_order_id"),
@@ -786,7 +831,7 @@ export const PaymentsTable = pgTable(
   },
   (t) => [
     // User payment history — paginated by date
-    index("payments_user_id_created_at_idx").on(t.userId, t.createdAt),
+    index("payments_user_created_at_idx").on(t.userId, t.createdAt),
     // Razorpay webhook lookup — must resolve in microseconds
     uniqueIndex("payments_razorpay_order_id_key").on(t.razorpayOrderId),
     // Admin revenue dashboard: type + status + date
@@ -795,9 +840,9 @@ export const PaymentsTable = pgTable(
       t.status,
       t.paidAt
     ),
-    // Polymorphic reference lookup
-    index("payments_reference_idx").on(t.referenceId, t.referenceType),
-    // Pending timeout job
+    // Session payment lookup (direct FK join replaces polymorphic lookup)
+    index("payments_session_id_idx").on(t.sessionId),
+    // Pending timeout job — partial
     index("payments_pending_idx")
       .on(t.createdAt)
       .where(sql`status = 'PENDING'`),
@@ -827,7 +872,7 @@ export const NotificationsTable = pgTable(
     createdAt: timestamp("created_at").defaultNow().notNull(),
   },
   (t) => [
-    // Notification bell: unread count — partial index (only unread rows)
+    // Notification bell unread count — partial (only unread rows)
     index("notifications_user_unread_idx")
       .on(t.userId, t.createdAt)
       .where(sql`is_read = false`),
@@ -840,7 +885,7 @@ export const NotificationsTable = pgTable(
 // ADMIN GOVERNANCE
 // =====================================================================
 
-// Immutable audit log — INSERT only
+// Immutable audit log — INSERT only, never UPDATE or DELETE
 export const AdminActionsTable = pgTable(
   "admin_actions",
   {
@@ -850,20 +895,17 @@ export const AdminActionsTable = pgTable(
       .references(() => UsersTable.id),
     targetUserId: uuid("target_user_id").references(() => UsersTable.id),
     // "APPROVE_USER" | "REJECT_USER" | "SUSPEND_USER" | "FEATURE_STARTUP"
-    // "UNFEATURE_STARTUP" | "UPDATE_FEE" | "RESOLVE_DISPUTE" | "REFUND_PAYMENT"
+    // "UNFEATURE_STARTUP" | "UPDATE_CONFIG" | "RESOLVE_DISPUTE" | "REFUND_PAYMENT"
     actionType: text("action_type").notNull(),
     targetType: text("target_type"),
     targetId: uuid("target_id"),
     reason: text("reason"),
-    metadata: text("metadata"), // JSON string
+    metadata: jsonb("metadata"), // replaces text(JSON) — queryable
     createdAt: timestamp("created_at").defaultNow().notNull(),
   },
   (t) => [
-    index("admin_actions_admin_id_created_at_idx").on(
-      t.adminId,
-      t.createdAt
-    ),
-    index("admin_actions_target_user_id_idx").on(t.targetUserId),
+    index("admin_actions_admin_created_at_idx").on(t.adminId, t.createdAt),
+    index("admin_actions_target_user_idx").on(t.targetUserId),
     index("admin_actions_action_type_created_at_idx").on(
       t.actionType,
       t.createdAt
@@ -871,25 +913,23 @@ export const AdminActionsTable = pgTable(
   ]
 );
 
-export const PlatformFeesTable = pgTable(
-  "platform_fees",
+// Replaces platform_fees — simple key-value config store.
+// Admin updates a single row; app reads by key. No uniqueness gymnastics.
+export const PlatformConfigTable = pgTable(
+  "platform_config",
   {
     id: uuid("id").defaultRandom().primaryKey().notNull(),
-    // "STARTUP_REGISTRATION" | "INVESTOR_MEMBERSHIP" | "MENTOR_COMMISSION_PERCENT"
-    feeType: text("fee_type").notNull(),
-    amountUsd: decimal("amount_usd", { precision: 10, scale: 2 }),
-    commissionPercent: decimal("commission_percent", {
-      precision: 5,
-      scale: 2,
-    }),
+    key: text("key").notNull(),
+    // e.g. "startup_registration_fee_usd" | "mentor_commission_percent"
+    //      "investor_membership_fee_usd"
+    value: text("value").notNull(),   // stored as string, cast at app layer
     description: text("description"),
-    isActive: boolean("is_active").default(true).notNull(),
     updatedBy: uuid("updated_by").references(() => UsersTable.id),
     createdAt: timestamp("created_at").defaultNow().notNull(),
     updatedAt: timestamp("updated_at").defaultNow().notNull(),
   },
   (t) => [
-    uniqueIndex("platform_fees_fee_type_key").on(t.feeType),
+    uniqueIndex("platform_config_key_key").on(t.key),
   ]
 );
 
@@ -905,8 +945,7 @@ export const DisputesTable = pgTable(
     description: text("description").notNull(),
     referenceType: text("reference_type"),
     referenceId: uuid("reference_id"),
-    // "OPEN" | "UNDER_REVIEW" | "RESOLVED" | "CLOSED"
-    status: text("status").default("OPEN").notNull(),
+    status: DisputeStatus("status").default("OPEN").notNull(),
     resolution: text("resolution"),
     resolvedBy: uuid("resolved_by").references(() => UsersTable.id),
     resolvedAt: timestamp("resolved_at", { mode: "date" }),
@@ -915,8 +954,8 @@ export const DisputesTable = pgTable(
   },
   (t) => [
     index("disputes_raised_by_idx").on(t.raisedBy),
-    // Admin open queue — partial index (only OPEN rows)
-    index("disputes_open_idx")
+    // Admin open queue — partial (only OPEN rows, tiny index)
+    index("disputes_open_created_at_idx")
       .on(t.createdAt)
       .where(sql`status = 'OPEN'`),
   ]
@@ -924,8 +963,7 @@ export const DisputesTable = pgTable(
 
 // =====================================================================
 // ANALYTICS EVENTS — append-only event log
-// Drives all dashboards. Never aggregates on business tables directly.
-// Future: partition by RANGE on created_at (monthly partitions).
+// Never aggregates on business tables. Future: partition by created_at.
 // =====================================================================
 
 export const AnalyticsEventsTable = pgTable(
@@ -940,7 +978,7 @@ export const AnalyticsEventsTable = pgTable(
     eventType: text("event_type").notNull(),
     resourceType: text("resource_type"),
     resourceId: uuid("resource_id"),
-    metadata: text("metadata"), // JSON string: filters, referrer, device
+    metadata: jsonb("metadata"), // replaces text(JSON) — queryable
     ipAddress: text("ip_address"),
     userAgent: text("user_agent"),
     createdAt: timestamp("created_at").defaultNow().notNull(),
@@ -967,14 +1005,18 @@ export const AnalyticsEventsTable = pgTable(
 
 // =====================================================================
 // DRIZZLE RELATIONS
-// Used by db.query.* for type-safe eager loading — no N+1.
-// One db.query call with `with` replaces many individual SELECT calls.
-// Relations do NOT create DB constraints — FKs on columns handle that.
+// Used by db.query.* for type-safe eager loading.
+// Relations do NOT create DB constraints — .references() handles that.
 // =====================================================================
 
-// ----- Users -----
+export const startupApplicationsRelations = relations(
+  StartupApplicationsTable,
+  ({ many }) => ({
+    payments: many(PaymentsTable),
+  })
+);
+
 export const usersRelations = relations(UsersTable, ({ one, many }) => ({
-  // Role-specific profile (only one will be populated per user)
   startupProfile: one(StartupProfilesTable, {
     fields: [UsersTable.id],
     references: [StartupProfilesTable.userId],
@@ -988,19 +1030,14 @@ export const usersRelations = relations(UsersTable, ({ one, many }) => ({
     references: [MentorProfilesTable.userId],
   }),
 
-  // Auth
   emailVerificationTokens: many(EmailVerificationTokenTable),
   passwordResetTokens: many(PasswordResetTokenTable),
-
-  // Financials & comms
   payments: many(PaymentsTable),
   notifications: many(NotificationsTable),
 
-  // Ratings given and received
   ratingsMade: many(SessionRatingsTable, { relationName: "rater" }),
   ratingsReceived: many(SessionRatingsTable, { relationName: "ratee" }),
 
-  // Messaging
   investorConversations: many(ConversationsTable, {
     relationName: "investorUser",
   }),
@@ -1009,19 +1046,15 @@ export const usersRelations = relations(UsersTable, ({ one, many }) => ({
   }),
   messagesSent: many(MessagesTable),
 
-  // Admin audit
   adminActionsPerformed: many(AdminActionsTable, { relationName: "admin" }),
   adminActionsReceived: many(AdminActionsTable, { relationName: "target" }),
 
-  // Disputes
   disputesRaised: many(DisputesTable, { relationName: "raisedByUser" }),
   disputesAgainst: many(DisputesTable, { relationName: "againstUser" }),
 
-  // Analytics
   analyticsEvents: many(AnalyticsEventsTable),
 }));
 
-// ----- Startup Profiles -----
 export const startupProfilesRelations = relations(
   StartupProfilesTable,
   ({ one, many }) => ({
@@ -1033,21 +1066,11 @@ export const startupProfilesRelations = relations(
       fields: [StartupProfilesTable.verifiedBy],
       references: [UsersTable.id],
     }),
-    founders: many(StartupFoundersTable),
+    // founders inlined as JSONB — no relation needed
     documents: many(StartupDocumentsTable),
     eois: many(EOITable),
     watchlistedBy: many(InvestorWatchlistTable),
     mentorSessions: many(MentorSessionsTable),
-  })
-);
-
-export const startupFoundersRelations = relations(
-  StartupFoundersTable,
-  ({ one }) => ({
-    startup: one(StartupProfilesTable, {
-      fields: [StartupFoundersTable.startupId],
-      references: [StartupProfilesTable.id],
-    }),
   })
 );
 
@@ -1061,7 +1084,6 @@ export const startupDocumentsRelations = relations(
   })
 );
 
-// ----- Investor Profiles -----
 export const investorProfilesRelations = relations(
   InvestorProfilesTable,
   ({ one, many }) => ({
@@ -1075,10 +1097,10 @@ export const investorProfilesRelations = relations(
     }),
     eois: many(EOITable),
     watchlist: many(InvestorWatchlistTable),
+    payments: many(PaymentsTable),
   })
 );
 
-// ----- Mentor Profiles -----
 export const mentorProfilesRelations = relations(
   MentorProfilesTable,
   ({ one, many }) => ({
@@ -1105,7 +1127,6 @@ export const mentorAvailabilityRelations = relations(
   })
 );
 
-// ----- EOI -----
 export const eoiRelations = relations(EOITable, ({ one }) => ({
   investor: one(InvestorProfilesTable, {
     fields: [EOITable.investorId],
@@ -1121,7 +1142,6 @@ export const eoiRelations = relations(EOITable, ({ one }) => ({
   }),
 }));
 
-// ----- Watchlist -----
 export const investorWatchlistRelations = relations(
   InvestorWatchlistTable,
   ({ one }) => ({
@@ -1136,7 +1156,6 @@ export const investorWatchlistRelations = relations(
   })
 );
 
-// ----- Conversations & Messages -----
 export const conversationsRelations = relations(
   ConversationsTable,
   ({ one, many }) => ({
@@ -1169,7 +1188,6 @@ export const messagesRelations = relations(MessagesTable, ({ one }) => ({
   }),
 }));
 
-// ----- Mentor Sessions -----
 export const mentorSessionsRelations = relations(
   MentorSessionsTable,
   ({ one, many }) => ({
@@ -1184,7 +1202,7 @@ export const mentorSessionsRelations = relations(
     ratings: many(SessionRatingsTable),
     payment: one(PaymentsTable, {
       fields: [MentorSessionsTable.id],
-      references: [PaymentsTable.referenceId],
+      references: [PaymentsTable.sessionId],
     }),
   })
 );
@@ -1209,15 +1227,25 @@ export const sessionRatingsRelations = relations(
   })
 );
 
-// ----- Payments -----
 export const paymentsRelations = relations(PaymentsTable, ({ one }) => ({
   user: one(UsersTable, {
     fields: [PaymentsTable.userId],
     references: [UsersTable.id],
   }),
+  session: one(MentorSessionsTable, {
+    fields: [PaymentsTable.sessionId],
+    references: [MentorSessionsTable.id],
+  }),
+  startupApplication: one(StartupApplicationsTable, {
+    fields: [PaymentsTable.startupApplicationId],
+    references: [StartupApplicationsTable.id],
+  }),
+  investorProfile: one(InvestorProfilesTable, {
+    fields: [PaymentsTable.investorProfileId],
+    references: [InvestorProfilesTable.id],
+  }),
 }));
 
-// ----- Notifications -----
 export const notificationsRelations = relations(
   NotificationsTable,
   ({ one }) => ({
@@ -1228,7 +1256,6 @@ export const notificationsRelations = relations(
   })
 );
 
-// ----- Admin Actions -----
 export const adminActionsRelations = relations(
   AdminActionsTable,
   ({ one }) => ({
@@ -1245,18 +1272,16 @@ export const adminActionsRelations = relations(
   })
 );
 
-// ----- Platform Fees -----
-export const platformFeesRelations = relations(
-  PlatformFeesTable,
+export const platformConfigRelations = relations(
+  PlatformConfigTable,
   ({ one }) => ({
     updatedByUser: one(UsersTable, {
-      fields: [PlatformFeesTable.updatedBy],
+      fields: [PlatformConfigTable.updatedBy],
       references: [UsersTable.id],
     }),
   })
 );
 
-// ----- Disputes -----
 export const disputesRelations = relations(DisputesTable, ({ one }) => ({
   raisedByUser: one(UsersTable, {
     fields: [DisputesTable.raisedBy],
@@ -1274,7 +1299,6 @@ export const disputesRelations = relations(DisputesTable, ({ one }) => ({
   }),
 }));
 
-// ----- Analytics -----
 export const analyticsEventsRelations = relations(
   AnalyticsEventsTable,
   ({ one }) => ({
@@ -1286,19 +1310,27 @@ export const analyticsEventsRelations = relations(
 );
 
 // =====================================================================
-// INFERRED TYPESCRIPT TYPES
-// Single source of truth — no manual interface duplication.
-// Use NewX types for INSERT, X types for SELECT results.
+// INFERRED TYPESCRIPT TYPES — single source of truth
 // =====================================================================
 
 export type User = typeof UsersTable.$inferSelect;
 export type NewUser = typeof UsersTable.$inferInsert;
 
+export type EmailVerificationToken =
+  typeof EmailVerificationTokenTable.$inferSelect;
+export type NewEmailVerificationToken =
+  typeof EmailVerificationTokenTable.$inferInsert;
+
+export type PasswordResetToken = typeof PasswordResetTokenTable.$inferSelect;
+export type NewPasswordResetToken =
+  typeof PasswordResetTokenTable.$inferInsert;
+
+export type StartupApplication = typeof StartupApplicationsTable.$inferSelect;
+export type NewStartupApplication =
+  typeof StartupApplicationsTable.$inferInsert;
+
 export type StartupProfile = typeof StartupProfilesTable.$inferSelect;
 export type NewStartupProfile = typeof StartupProfilesTable.$inferInsert;
-
-export type StartupFounder = typeof StartupFoundersTable.$inferSelect;
-export type NewStartupFounder = typeof StartupFoundersTable.$inferInsert;
 
 export type StartupDocument = typeof StartupDocumentsTable.$inferSelect;
 export type NewStartupDocument = typeof StartupDocumentsTable.$inferInsert;
@@ -1340,11 +1372,26 @@ export type NewNotification = typeof NotificationsTable.$inferInsert;
 export type AdminAction = typeof AdminActionsTable.$inferSelect;
 export type NewAdminAction = typeof AdminActionsTable.$inferInsert;
 
-export type PlatformFee = typeof PlatformFeesTable.$inferSelect;
-export type NewPlatformFee = typeof PlatformFeesTable.$inferInsert;
+export type PlatformConfig = typeof PlatformConfigTable.$inferSelect;
+export type NewPlatformConfig = typeof PlatformConfigTable.$inferInsert;
 
 export type Dispute = typeof DisputesTable.$inferSelect;
 export type NewDispute = typeof DisputesTable.$inferInsert;
 
 export type AnalyticsEvent = typeof AnalyticsEventsTable.$inferSelect;
 export type NewAnalyticsEvent = typeof AnalyticsEventsTable.$inferInsert;
+
+// =====================================================================
+// JSONB SHAPE TYPES
+// Validated at app layer (Zod). Kept here for documentation.
+// =====================================================================
+
+export type FounderEntry = {
+  name: string;
+  role: string;         // "CEO" | "CTO" | "COO" | ...
+  bio?: string;
+  linkedinUrl?: string;
+  avatarUrl?: string;
+  isLeadFounder: boolean;
+};
+// Usage: (profile.founders as FounderEntry[])

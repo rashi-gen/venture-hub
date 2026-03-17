@@ -6,10 +6,10 @@ export const DEFAULT_LOGIN_REDIRECT: string = "/dashboard";
 export const apiAuthPrefix: string = "/api/auth";
 
 // Routes which are accessible to all.
-export const publicRoutes: string[] = ["/", "/auth/verify-email", "/investors", "/startups" , "/cohort", "/mentorship", "/profile"];
+export const publicRoutes: string[] = ["/", "/auth/verify-email", "/investors", "/startups" , "/cohort", "/mentorship", "/profile", ""];
 
 // APIs which are accessible to all.
-export const publicApis: string[] = [];
+export const publicApis: string[] = ["/api/apply"];
 
 // Routes which are used for authentication.
 export const authRoutes: string[] = [
