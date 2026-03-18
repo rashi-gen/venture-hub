@@ -7,19 +7,19 @@ const features = [
     title: "Early-Stage Cultivation",
     description: "Tailored seed and pre-seed support for technical founders with an ethical north star.",
     bg: "bg-white",
-    iconBg: "bg-forest/5",
-    iconColor: "text-forest",
-    titleColor: "text-forest",
-    descColor: "text-forest/60",
+    iconBg: "bg-[#1A362B]/5",
+    iconColor: "text-[#1A362B]",
+    titleColor: "text-[#1A362B]",
+    descColor: "text-[#1A362B]/60",
     offset: false,
   },
   {
     icon: Sun,
     title: "Institutional Exposure",
     description: "Connect directly with institutional-grade capital that understands long-term value creation.",
-    bg: "bg-forest",
+    bg: "bg-[#1A362B]",
     iconBg: "bg-white/10",
-    iconColor: "text-beige",
+    iconColor: "text-[#EFEBE3]",
     titleColor: "text-white",
     descColor: "text-white/60",
     offset: true,
@@ -29,39 +29,38 @@ const features = [
     title: "Master Mentorship",
     description: "Guidance from veterans who have successfully navigated the complexities of global scaling.",
     bg: "bg-white",
-    iconBg: "bg-forest/5",
-    iconColor: "text-forest",
-    titleColor: "text-forest",
-    descColor: "text-forest/60",
+    iconBg: "bg-[#1A362B]/5",
+    iconColor: "text-[#1A362B]",
+    titleColor: "text-[#1A362B]",
+    descColor: "text-[#1A362B]/60",
     offset: false,
   },
   {
     icon: BarChart3,
     title: "Sustainable Metrics",
     description: "Measuring success not just in growth, but in social and environmental resonance.",
-    bg: "bg-beige",
-    iconBg: "bg-forest/10",
-    iconColor: "text-forest",
-    titleColor: "text-forest",
-    descColor: "text-forest/60",
+    bg: "bg-[#EFEBE3]",
+    iconBg: "bg-[#1A362B]/10",
+    iconColor: "text-[#1A362B]",
+    titleColor: "text-[#1A362B]",
+    descColor: "text-[#1A362B]/60",
     offset: true,
   },
 ];
 
 export function MissionSection() {
   return (
-    <section id="mission" className="py-20 sm:py-32 px-4 sm:px-8 bg-beige/30">
+    <section className="py-20 sm:py-32 px-4 sm:px-8 bg-[#EFEBE3]/30">
       <div className="max-w-7xl mx-auto">
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-12 lg:gap-20">
-
-          {/* Left sticky text */}
+          {/* Left Sticky Content */}
           <div className="lg:col-span-5">
             <div className="lg:sticky lg:top-32">
-              <h2 className="font-serif text-3xl sm:text-4xl lg:text-5xl text-forest mb-6 sm:mb-8 leading-tight">
+              <h2 className="font-serif text-3xl sm:text-4xl lg:text-5xl text-[#1A362B] mb-6 sm:mb-8 leading-tight">
                 Our mission is to foster a symbiotic{" "}
                 <span className="italic">ecosystem</span> where impact meets intelligence.
               </h2>
-              <div className="space-y-4 sm:space-y-6 text-forest/70 leading-relaxed text-base sm:text-lg">
+              <div className="space-y-4 sm:space-y-6 text-[#1A362B]/70 leading-relaxed text-base sm:text-lg">
                 <p>
                   We believe that capital should be as visionary as the founders it supports.
                   Our platform isn't just a marketplace; it's a living greenhouse for ideas that
@@ -73,8 +72,8 @@ export function MissionSection() {
                 </p>
               </div>
               <Link
-                href="#"
-                className="inline-flex items-center gap-4 mt-8 sm:mt-12 text-forest font-bold uppercase text-xs tracking-widest group"
+                href="/about"
+                className="inline-flex items-center gap-4 mt-8 sm:mt-12 text-[#1A362B] font-bold uppercase text-xs tracking-widest group"
               >
                 Discover Our Roots{" "}
                 <ArrowRight className="w-4 h-4 group-hover:translate-x-2 transition-transform" />
@@ -82,12 +81,12 @@ export function MissionSection() {
             </div>
           </div>
 
-          {/* Right grid */}
+          {/* Right Grid with Cards */}
           <div className="lg:col-span-7 grid grid-cols-1 sm:grid-cols-2 gap-6 sm:gap-8">
             {features.map(({ icon: Icon, title, description, bg, iconBg, iconColor, titleColor, descColor, offset }) => (
               <div
                 key={title}
-                className={`${bg} p-8 sm:p-12 shadow-sm border border-forest/5 flex flex-col justify-between min-h-[280px] sm:h-[400px] ${
+                className={`${bg} p-8 sm:p-12 shadow-sm border border-[#1A362B]/5 flex flex-col justify-between min-h-[280px] sm:h-[400px] ${
                   offset ? "sm:translate-y-8 lg:translate-y-12" : ""
                 }`}
               >

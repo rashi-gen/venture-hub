@@ -15,9 +15,10 @@ import Link from "next/link";
 import { useState, useTransition } from "react";
 import { useForm } from "react-hook-form";
 import { z } from "zod";
-import { initiatePasswordReset } from "@/actions/initiatePasswordReset";
+
 import { ForgotPasswordSchema } from "@/validaton-schema";
 import Image from "next/image";
+import { initiatePasswordReset } from "@/actions/initiatePasswordReset";
 
 export function ForgotPasswordForm() {
   const [error, setError] = useState<string | undefined>(undefined);
