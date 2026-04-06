@@ -196,6 +196,7 @@ export const UsersTable = pgTable(
     avatarUrl: text("avatar_url"),
     isActive: boolean("is_active").default(true).notNull(),
     lastLoginAt: timestamp("last_login_at", { mode: "date" }),
+     mustChangePassword: boolean("must_change_password").default(false).notNull(),
 
     createdAt: timestamp("created_at").defaultNow().notNull(),
     updatedAt: timestamp("updated_at").defaultNow().notNull(),
@@ -208,6 +209,10 @@ export const UsersTable = pgTable(
     index("users_role_idx").on(t.role),
     // Session validation — only active users
     index("users_active_idx").on(t.isActive).where(sql`is_active = true`),
+     // Partial index for forced-change queue — tiny, fast
+    index("users_must_change_password_idx")
+      .on(t.id)
+      .where(sql`must_change_password = true`),
   ]
 );
 
