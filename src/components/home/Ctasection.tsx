@@ -2,9 +2,9 @@ import Link from "next/link";
 
 export function CTASection() {
   return (
-    <section className="py-24 sm:py-40 px-4 sm:px-8 relative overflow-hidden">
+    <section className="py-24 sm:py-40 px-4 sm:px-8 relative overflow-hidden bg-[#1A362B]">
       {/* Dark Background */}
-      <div className="absolute inset-0 bg-[#1A362B] -z-10" />
+      <div className="absolute inset-0  -z-10" />
       
       {/* Decorative Organic Blob */}
       <div className="absolute top-0 right-0 w-[400px] sm:w-[800px] h-[400px] sm:h-[800px] bg-white/5 rounded-full blur-3xl -translate-y-1/2 translate-x-1/2" />
