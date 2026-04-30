@@ -162,42 +162,62 @@ export async function GET(req: NextRequest) {
   const admin = await requireAdmin();
   if (!admin) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
-  const { searchParams } = new URL(req.url);
-  const status = searchParams.get("status") || "";
-  const search = searchParams.get("search") || "";
-  const page   = Math.max(1, parseInt(searchParams.get("page")  || "1", 10));
-  const limit  = Math.min(100, parseInt(searchParams.get("limit") || "20", 10));
-  const offset = (page - 1) * limit;
+  try {
+    const { searchParams } = new URL(req.url);
+    const status = searchParams.get("status") || "";
+    const search = searchParams.get("search") || "";
+    const page   = Math.max(1, parseInt(searchParams.get("page")  || "1", 10));
+    const limit  = Math.min(100, parseInt(searchParams.get("limit") || "20", 10));
+    const offset = (page - 1) * limit;
 
-  const conditions = [];
-  if (status && ["SUBMITTED", "UNDER_REVIEW", "APPROVED", "REJECTED"].includes(status)) {
-    conditions.push(
-      eq(StartupApplicationsTable.status, status as "SUBMITTED" | "UNDER_REVIEW" | "APPROVED" | "REJECTED")
-    );
+    const conditions = [];
+    if (status && ["SUBMITTED", "UNDER_REVIEW", "APPROVED", "REJECTED"].includes(status)) {
+      conditions.push(
+        eq(StartupApplicationsTable.status, status as "SUBMITTED" | "UNDER_REVIEW" | "APPROVED" | "REJECTED")
+      );
+    }
+    if (search) {
+      conditions.push(
+        or(
+          ilike(StartupApplicationsTable.founderName, `%${search}%`),
+          ilike(StartupApplicationsTable.companyName, `%${search}%`),
+          ilike(StartupApplicationsTable.email, `%${search}%`)
+        )
+      );
+    }
+
+    const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
+    const [applications, [{ total }]] = await Promise.all([
+      db.select().from(StartupApplicationsTable)
+        .where(whereClause)
+        .orderBy(desc(StartupApplicationsTable.createdAt))
+        .limit(limit).offset(offset),
+      db.select({ total: count() }).from(StartupApplicationsTable).where(whereClause),
+    ]);
+
+    return NextResponse.json({
+      data: applications,
+      meta: { total, page, limit, totalPages: Math.ceil(total / limit) },
+    });
+
+  } catch (err) {
+    console.error("[GET /api/admin/startup-applications]", err);
+    return NextResponse.json({
+      error: "Internal error",
+      detail: (err as Error).message,
+      stack: (err as Error).stack,
+    }, { status: 500 });
   }
-  if (search) {
-    conditions.push(
-      or(
-        ilike(StartupApplicationsTable.founderName, `%${search}%`),
-        ilike(StartupApplicationsTable.companyName, `%${search}%`),
-        ilike(StartupApplicationsTable.email, `%${search}%`)
-      )
-    );
-  }
+}
 
-  const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
-  const [applications, [{ total }]] = await Promise.all([
-    db.select().from(StartupApplicationsTable)
-      .where(whereClause)
-      .orderBy(desc(StartupApplicationsTable.createdAt))
-      .limit(limit).offset(offset),
-    db.select({ total: count() }).from(StartupApplicationsTable).where(whereClause),
-  ]);
-
-  return NextResponse.json({
-    data: applications,
-    meta: { total, page, limit, totalPages: Math.ceil(total / limit) },
-  });
+// ── Helpers ────────────────────────────────────────────────────────────────
+function parseCapital(value: string | null | undefined): string | null {
+  if (!value) return null;
+  const cleaned = value.replace(/[^0-9.]/g, "").trim();
+  if (!cleaned) return null;
+  const num = parseFloat(cleaned);
+  if (isNaN(num)) return null;
+  return Math.min(num, 9_999_999_999_999.99).toFixed(2);
 }
 
 // ── PATCH /api/admin/startup-applications ─────────────────────────────────
@@ -205,97 +225,153 @@ export async function PATCH(req: NextRequest) {
   const admin = await requireAdmin();
   if (!admin) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
-  const body = await req.json();
-  const { id, action, reviewNotes } = body as {
-    id: string;
-    action: "approve" | "reject" | "under_review";
-    reviewNotes?: string;
-  };
+  try {
+    const body = await req.json();
+    const { id, action, reviewNotes } = body as {
+      id: string;
+      action: "approve" | "reject" | "under_review";
+      reviewNotes?: string;
+    };
 
-  if (!id || !action) {
-    return NextResponse.json({ error: "id and action are required" }, { status: 400 });
-  }
-
-  const [application] = await db
-    .select().from(StartupApplicationsTable)
-    .where(eq(StartupApplicationsTable.id, id))
-    .limit(1);
-
-  if (!application) {
-    return NextResponse.json({ error: "Application not found" }, { status: 404 });
-  }
-
-  if (application.status === "APPROVED") {
-    return NextResponse.json({ error: "Application already approved" }, { status: 409 });
-  }
-  if (application.status === "REJECTED") {
-    return NextResponse.json({ error: "Application already rejected" }, { status: 409 });
-  }
-
-  const now = new Date();
-
-  // ── UNDER REVIEW ──────────────────────────────────────────────────────
-  if (action === "under_review") {
-    await db.update(StartupApplicationsTable).set({
-      status: "UNDER_REVIEW",
-      reviewedBy: admin.id,
-      reviewNotes: reviewNotes || null,
-      reviewedAt: now,
-      updatedAt: now,
-    }).where(eq(StartupApplicationsTable.id, id));
-
-    sendEmail(
-      "VentureHub",
-      application.email,
-      `Your VentureHub application is under review — ${application.companyName}`,
-      buildUnderReviewEmail(application.founderName, application.companyName)
-    ).catch((err) => console.error("[mailer] under_review email failed:", err));
-
-    return NextResponse.json({ success: true, status: "UNDER_REVIEW" });
-  }
-
-  // ── REJECT ────────────────────────────────────────────────────────────
-  if (action === "reject") {
-    await db.update(StartupApplicationsTable).set({
-      status: "REJECTED",
-      reviewedBy: admin.id,
-      reviewNotes: reviewNotes || null,
-      reviewedAt: now,
-      updatedAt: now,
-    }).where(eq(StartupApplicationsTable.id, id));
-
-    sendEmail(
-      "VentureHub",
-      application.email,
-      `Update on your VentureHub application — ${application.companyName}`,
-      buildRejectionEmail(application.founderName, application.companyName, reviewNotes)
-    ).catch((err) => console.error("[mailer] rejection email failed:", err));
-
-    return NextResponse.json({ success: true, status: "REJECTED" });
-  }
-
-  // ── APPROVE ───────────────────────────────────────────────────────────
-  if (action === "approve") {
-    const [existingUser] = await db
-      .select({ id: UsersTable.id })
-      .from(UsersTable)
-      .where(eq(UsersTable.email, application.email))
-      .limit(1);
-
-    if (existingUser) {
-      return NextResponse.json(
-        { error: "A user with this email already exists" },
-        { status: 409 }
-      );
+    if (!id || !action) {
+      return NextResponse.json({ error: "id and action are required" }, { status: 400 });
     }
 
-    const tempPassword       = generateTempPassword();
-    const hashedTempPassword = await bcrypt.hash(tempPassword, 10);
-    const newUserId          = randomUUID();
+    const [application] = await db
+      .select().from(StartupApplicationsTable)
+      .where(eq(StartupApplicationsTable.id, id))
+      .limit(1);
 
-    try {
+    if (!application) {
+      return NextResponse.json({ error: "Application not found" }, { status: 404 });
+    }
+
+    if (application.status === "REJECTED") {
+      return NextResponse.json({ error: "Application already rejected" }, { status: 409 });
+    }
+
+    const now = new Date();
+
+    // ── under_review ────────────────────────────────────────────────────────
+    if (action === "under_review") {
+      await db.update(StartupApplicationsTable).set({
+        status: "UNDER_REVIEW",
+        reviewedBy: admin.id,
+        reviewNotes: reviewNotes || null,
+        reviewedAt: now,
+        updatedAt: now,
+      }).where(eq(StartupApplicationsTable.id, id));
+
+      sendEmail(
+        "VentureHub",
+        application.email,
+        `Your VentureHub application is under review — ${application.companyName}`,
+        buildUnderReviewEmail(application.founderName, application.companyName)
+      ).catch((err) => console.error("[mailer] under_review email failed:", err));
+
+      return NextResponse.json({ success: true, status: "UNDER_REVIEW" });
+    }
+
+    // ── reject ──────────────────────────────────────────────────────────────
+    if (action === "reject") {
+      await db.update(StartupApplicationsTable).set({
+        status: "REJECTED",
+        reviewedBy: admin.id,
+        reviewNotes: reviewNotes || null,
+        reviewedAt: now,
+        updatedAt: now,
+      }).where(eq(StartupApplicationsTable.id, id));
+
+      sendEmail(
+        "VentureHub",
+        application.email,
+        `Update on your VentureHub application — ${application.companyName}`,
+        buildRejectionEmail(application.founderName, application.companyName, reviewNotes)
+      ).catch((err) => console.error("[mailer] rejection email failed:", err));
+
+      return NextResponse.json({ success: true, status: "REJECTED" });
+    }
+
+    // ── approve ─────────────────────────────────────────────────────────────
+    if (action === "approve") {
+      // ── FIX: Handle already-approved and partial-failure cases ─────────────
+      //
+      // The previous code had a hard 409 guard on `status === "APPROVED"` AND
+      // a separate hard 409 when an existing user was found. This caused two
+      // failure modes:
+      //
+      // 1. Transaction partial failure: the DB transaction committed the INSERT
+      //    into UsersTable + StartupProfilesTable but then failed to UPDATE
+      //    StartupApplicationsTable (network drop, timeout, etc.).  The
+      //    application row is still SUBMITTED/UNDER_REVIEW, so the status guard
+      //    passes — but the email-uniqueness check fires a 409.
+      //
+      // 2. Admin double-click / retry: application is already APPROVED, but the
+      //    UI didn't refresh in time and the admin clicked Approve again.
+      //
+      // Fix strategy:
+      //   a) If the application is already APPROVED → idempotent 200, no-op.
+      //   b) If a user exists and it was created by THIS application
+      //      (application.createdUserId === existingUser.id) → the transaction
+      //      previously half-succeeded; reconcile by stamping the application
+      //      row APPROVED and returning success.
+      //   c) If a user exists but belongs to a different account → genuine
+      //      email conflict, return 409 with a clear message.
+      //   d) Happy path: no existing user → run the full transaction as before.
+      // ──────────────────────────────────────────────────────────────────────
+
+      // Case (a): already fully approved — idempotent success
+      if (application.status === "APPROVED") {
+        return NextResponse.json({
+          success: true,
+          status: "APPROVED",
+          userId: application.createdUserId,
+          idempotent: true,
+        });
+      }
+
+      const [existingUser] = await db
+        .select({ id: UsersTable.id })
+        .from(UsersTable)
+        .where(eq(UsersTable.email, application.email))
+        .limit(1);
+
+      if (existingUser) {
+        // Case (b): partial transaction failure — reconcile
+        if (application.createdUserId === existingUser.id) {
+          await db.update(StartupApplicationsTable).set({
+            status:      "APPROVED",
+            reviewedBy:  admin.id,
+            reviewNotes: reviewNotes || null,
+            reviewedAt:  now,
+            updatedAt:   now,
+          }).where(eq(StartupApplicationsTable.id, id));
+
+          console.warn(
+            `[approve] Reconciled partial failure for application ${id} — user ${existingUser.id} already existed`
+          );
+
+          return NextResponse.json({
+            success: true,
+            status: "APPROVED",
+            userId: existingUser.id,
+            recovered: true,
+          });
+        }
+
+        // Case (c): genuine email conflict with a different account
+        return NextResponse.json(
+          { error: "A user with this email already exists under a different account" },
+          { status: 409 }
+        );
+      }
+
+      // Case (d): happy path — create user + profile atomically
+      const tempPassword       = generateTempPassword();
+      const hashedTempPassword = await bcrypt.hash(tempPassword, 10);
+      const newUserId          = randomUUID();
+
       await db.transaction(async (tx) => {
-        // 1. Create user
         await tx.insert(UsersTable).values({
           id:                 newUserId,
           name:               application.founderName,
@@ -310,29 +386,23 @@ export async function PATCH(req: NextRequest) {
           updatedAt:          now,
         });
 
-        // 2. Create startup profile — map flat application columns to profile columns
         await tx.insert(StartupProfilesTable).values({
-          userId:              newUserId,
-          companyName:         application.companyName,
-          websiteUrl:          application.websiteUrl          || null,
-          sector:              application.sector,
-          stage:               application.stage,
-          country:             application.country             || null,
-          // Map flat application fields → startup profile fields
-          impactDescription:   application.impactDescription   || null,
-          useOfFunds:          application.useOfFunds          || null,
-          // capitalRequested and fundingPeriod have no direct profile columns;
-          // store capital as fundingAskMin for reference (cast to string for decimal)
-          fundingAskMin:       application.capitalRequested    || null,
-          approvalStatus:      "APPROVED",
-          profileScore:        10,
-          founders:            [],
-          sdgGoals:            [],
-          createdAt:           now,
-          updatedAt:           now,
+          userId:            newUserId,
+          companyName:       application.companyName,
+          websiteUrl:        application.websiteUrl        || null,
+          sector:            application.sector,
+          stage:             application.stage,
+          country:           application.country           || null,
+          impactDescription: application.impactDescription || null,
+          useOfFunds:        application.useOfFunds        || null,
+          approvalStatus:    "APPROVED",
+          profileScore:      10,
+          founders:          [],
+          sdgGoals:          [],
+          createdAt:         now,
+          updatedAt:         now,
         });
 
-        // 3. Mark application as approved
         await tx.update(StartupApplicationsTable).set({
           status:        "APPROVED",
           reviewedBy:    admin.id,
@@ -342,16 +412,8 @@ export async function PATCH(req: NextRequest) {
           updatedAt:     now,
         }).where(eq(StartupApplicationsTable.id, id));
       });
-    } catch (err) {
-      console.error("[approve] transaction failed:", err);
-      return NextResponse.json(
-        { error: "Failed to create account. Please try again." },
-        { status: 500 }
-      );
-    }
 
-    const loginUrl = `${process.env.NEXT_PUBLIC_BASE_URL}/auth/login`;
-    try {
+      const loginUrl = `${process.env.NEXT_PUBLIC_BASE_URL}/auth/login`;
       await sendEmail(
         "VentureHub",
         application.email,
@@ -365,18 +427,17 @@ export async function PATCH(req: NextRequest) {
           reviewNotes
         )
       );
-    } catch (err) {
-      console.error("[approve] credentials email failed:", err);
-      return NextResponse.json({
-        success: true,
-        status: "APPROVED",
-        userId: newUserId,
-        emailFailed: true,
-      });
+
+      return NextResponse.json({ success: true, status: "APPROVED", userId: newUserId });
     }
 
-    return NextResponse.json({ success: true, status: "APPROVED", userId: newUserId });
-  }
+    return NextResponse.json({ error: "Invalid action" }, { status: 400 });
 
-  return NextResponse.json({ error: "Invalid action" }, { status: 400 });
+  } catch (err) {
+    console.error("[PATCH /api/admin/startup-applications] ERROR:", err);
+    return NextResponse.json({
+      error: "Internal error",
+      detail: (err as Error).message,
+    }, { status: 500 });
+  }
 }

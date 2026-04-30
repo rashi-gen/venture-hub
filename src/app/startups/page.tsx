@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useRef } from "react";
 import { useRouter } from "next/navigation";
+import Image from "next/image";
 import {
   Save, CheckCircle, Loader2, AlertCircle,
   ChevronLeft, ChevronRight, X, ChevronDown, Search,
@@ -9,18 +10,19 @@ import {
 import { Navigation } from "@/components/home/Navigation";
 import { Footer } from "@/components/home/Footer";
 import { parsePhoneNumber, isValidPhoneNumber, CountryCode } from "libphonenumber-js";
+import { CHAR_LIMITS, SECTOR_VALUES, SectorValue } from "@/lib/applicationSchema";
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+// ─── Types ─────────────────────────────────────────────────────────────────────
 
 interface CountryData {
-  code: string;      // "IN"
-  name: string;      // "India"
-  flag: string;      // SVG URL
-  dial: string;      // "+91"
-  currency: string;  // "INR"
+  code:     string;
+  name:     string;
+  flag:     string;
+  dial:     string;
+  currency: string;
 }
 
-// ─── Constants ────────────────────────────────────────────────────────────────
+// ─── Constants ─────────────────────────────────────────────────────────────────
 
 const stageMapping = {
   "Ideation":     "IDEA",
@@ -28,7 +30,9 @@ const stageMapping = {
   "Seed / Early": "SEED",
 } as const;
 
-const industryOptions = [
+type StageLabel = keyof typeof stageMapping;
+
+const industryOptions: { value: SectorValue; label: string }[] = [
   { value: "climatetech", label: "Climatetech" },
   { value: "biotech",     label: "Biotechnology" },
   { value: "agtech",      label: "Agtech" },
@@ -52,18 +56,6 @@ const steps = [
   { num: "04", title: "Capital Needs",    sub: "Terms & Deployment",  icon: "💰" },
   { num: "05", title: "The Collective",   sub: "Team & Outreach",     icon: "🤝" },
 ];
-
-const CHAR_LIMITS: Record<string, number> = {
-  founderName:       60,
-  companyName:       80,
-  websiteUrl:        200,
-  impactDescription: 500,
-  impactMetrics:     150,
-  capitalRequested:  20,
-  useOfFunds:        400,
-  pitchDeckUrl:      300,
-  country:           60,
-};
 
 const CURRENCIES = [
   { code: "USD", symbol: "$",    name: "US Dollar" },
@@ -102,6 +94,8 @@ const CURRENCIES = [
   { code: "EGP", symbol: "E£",   name: "Egyptian Pound" },
 ];
 
+const VALID_CURRENCY_CODES = new Set(CURRENCIES.map((c) => c.code));
+
 const PERIOD_UNITS = ["Days", "Months", "Years"] as const;
 type PeriodUnit = typeof PERIOD_UNITS[number];
 
@@ -137,7 +131,139 @@ const TZ_TO_CC: Record<string, string> = {
   "Europe/Warsaw": "PL", "Europe/Zurich": "CH", "Pacific/Auckland": "NZ",
 };
 
-// ─── Micro components ─────────────────────────────────────────────────────────
+// ─── Required fields per step ──────────────────────────────────────────────────
+
+const REQUIRED_FIELDS: Record<number, string[]> = {
+  0: ["founderName", "email"],
+  1: ["companyName", "sector"],
+  2: [],
+  3: [],
+  4: [],
+};
+
+const REQUIRED_FIELD_LABELS: Record<string, string> = {
+  founderName: "Full Name",
+  email:       "Professional Email",
+  companyName: "Company Name",
+  sector:      "Primary Industry",
+};
+
+// ─── Validation ────────────────────────────────────────────────────────────────
+
+type VResult = { error?: string; warning?: string; success?: string };
+
+function validate(
+  id: string,
+  value: string,
+  ctx: { dialCountry?: string } = {}
+): VResult {
+  switch (id) {
+    case "founderName":
+      if (!value.trim()) return { warning: "Full name is required to proceed" };
+      if (value.trim().length < 2) return { error: "At least 2 characters" };
+      if (value.length > CHAR_LIMITS.founderName) return { error: `Max ${CHAR_LIMITS.founderName} characters` };
+      if (!/^[A-Za-z\u00C0-\u017E\s'\-]+$/.test(value.trim()))
+        return { error: "Only letters, spaces, hyphens and apostrophes" };
+      return { success: "Looks good" };
+
+    case "email": {
+      if (!value.trim()) return { warning: "Email address is required" };
+      if (value.length > CHAR_LIMITS.email) return { error: "Email is too long" };
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(value.trim()))
+        return { error: "Doesn't look valid — try name@company.com" };
+      if (value.toLowerCase().endsWith(".con") || value.toLowerCase().endsWith(".cmo"))
+        return { error: "Possible typo — did you mean .com?" };
+      const domain = value.split("@")[1]?.toLowerCase();
+      if (FREE_EMAIL_DOMAINS.includes(domain))
+        return { warning: "We recommend a professional work email" };
+      return { success: "Valid email" };
+    }
+
+    case "mobile": {
+      if (!value.trim()) return {};
+      if (!ctx.dialCountry) return { warning: "Select a country code to validate" };
+      try {
+        if (!isValidPhoneNumber(value, ctx.dialCountry as CountryCode))
+          return { error: "Invalid number for the selected country" };
+        const p = parsePhoneNumber(value, ctx.dialCountry as CountryCode);
+        return { success: `Valid · ${p.formatInternational()}` };
+      } catch {
+        return { error: "Could not parse — check the format" };
+      }
+    }
+
+    case "companyName":
+      if (!value.trim()) return { warning: "Company name is required" };
+      if (value.trim().length < 2) return { error: "At least 2 characters" };
+      if (value.length > CHAR_LIMITS.companyName) return { error: `Max ${CHAR_LIMITS.companyName} characters` };
+      return { success: "Looks good" };
+
+    case "sector":
+      if (!value) return { warning: "Please select an industry to continue" };
+      if (!(SECTOR_VALUES as readonly string[]).includes(value))
+        return { error: "Please select a valid industry" };
+      return {};
+
+    case "websiteUrl":
+      if (!value.trim()) return { warning: "A website builds credibility with reviewers" };
+      if (!value.trim().startsWith("https://"))
+        return { error: "Must start with https:// for security" };
+      if (!/^https:\/\/.+\..+/.test(value.trim()))
+        return { error: "Must be a valid URL — e.g. https://yoursite.com" };
+      if (value.length > CHAR_LIMITS.websiteUrl) return { error: `Max ${CHAR_LIMITS.websiteUrl} characters` };
+      return { success: "Valid URL" };
+
+    case "country":
+      if (!value.trim()) return { warning: "Helps us match regional investors" };
+      return {};
+
+    case "impactDescription":
+      if (!value.trim()) return { warning: "Describe your impact — reviewed 2× faster" };
+      if (value.trim().length < 30) return { warning: "A bit more detail helps reviewers" };
+      if (value.length > CHAR_LIMITS.impactDescription) return { error: `Max ${CHAR_LIMITS.impactDescription} characters` };
+      return { success: "Great — adds real depth to your application" };
+
+    case "capitalRequested": {
+      if (!value.trim()) return { warning: "Specifying an amount helps investors assess fit" };
+      const digits = value.replace(/[^\d]/g, "");
+      if (!digits) return { error: "Please enter a numeric amount" };
+      return {};
+    }
+
+    case "fundingPeriod":
+      if (!value.trim()) return { warning: "Let investors know your expected runway" };
+      return {};
+
+    case "useOfFunds":
+      if (!value.trim()) return { warning: "A brief breakdown increases reviewer confidence" };
+      if (value.length > CHAR_LIMITS.useOfFunds) return { error: `Max ${CHAR_LIMITS.useOfFunds} characters` };
+      return {};
+
+    case "pitchDeckUrl":
+      if (!value.trim()) return { warning: "Applications with a pitch deck are 3× more likely to advance" };
+      if (!value.trim().startsWith("https://"))
+        return { error: "Must start with https://" };
+      if (!/^https:\/\/.+\..+/.test(value.trim()))
+        return { error: "Must be a valid URL" };
+      if (value.length > CHAR_LIMITS.pitchDeckUrl) return { error: `Max ${CHAR_LIMITS.pitchDeckUrl} characters` };
+      return { success: "Link looks valid" };
+
+    default:
+      return {};
+  }
+}
+
+// ─── Step field map ────────────────────────────────────────────────────────────
+
+const STEP_FIELDS: Record<number, string[]> = {
+  0: ["founderName", "email", "mobile"],
+  1: ["companyName", "sector", "websiteUrl", "country"],
+  2: ["impactDescription"],
+  3: ["capitalRequested", "fundingPeriod", "useOfFunds"],
+  4: ["pitchDeckUrl"],
+};
+
+// ─── Micro components ──────────────────────────────────────────────────────────
 
 function FieldError({ msg }: { msg?: string }) {
   if (!msg) return null;
@@ -175,98 +301,71 @@ function CharCount({ cur, max }: { cur: number; max: number }) {
   );
 }
 
-// ─── Field validation (single source of truth) ───────────────────────────────
+// ─── Industry dropdown ─────────────────────────────────────────────────────────
 
-type VResult = { error?: string; warning?: string; success?: string };
+function IndustryDropdown({
+  value, onChange, hasError, hasWarning,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  hasError?: boolean;
+  hasWarning?: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  const selected = industryOptions.find(o => o.value === value);
 
-function validate(
-  id: string,
-  value: string,
-  ctx: { dialCountry?: string } = {}
-): VResult {
-  switch (id) {
-    case "founderName":
-      if (!value.trim()) return { error: "Please enter your full name" };
-      if (value.trim().length < 2) return { error: "At least 2 characters" };
-      if (!/^[A-Za-z\u00C0-\u017E\s'\-]+$/.test(value.trim()))
-        return { error: "Only letters, spaces, hyphens and apostrophes" };
-      return { success: "Looks good" };
+  useEffect(() => {
+    const h = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("mousedown", h);
+    return () => document.removeEventListener("mousedown", h);
+  }, []);
 
-    case "email": {
-      if (!value.trim()) return { error: "Email is required" };
-      if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(value.trim()))
-        return { error: "Doesn't look valid — try name@company.com" };
-      if (value.toLowerCase().endsWith(".con") || value.toLowerCase().endsWith(".cmo"))
-        return { error: "Possible typo — did you mean .com?" };
-      const domain = value.split("@")[1]?.toLowerCase();
-      if (FREE_EMAIL_DOMAINS.includes(domain))
-        return { warning: "We recommend a professional work email" };
-      return { success: "Valid email" };
-    }
+  return (
+    <div className="relative" ref={ref}>
+      <button
+        type="button"
+        onClick={() => setOpen(o => !o)}
+        className={`input-field w-full flex items-center justify-between gap-2 cursor-pointer select-none text-left ${
+          hasError   ? "border-red-300 bg-red-50/30"    :
+          hasWarning ? "border-amber-300 bg-amber-50/20" : ""
+        }`}
+      >
+        <span className={selected ? "text-forest text-sm font-medium" : "text-forest/35 text-sm"}>
+          {selected ? selected.label : "Select Industry"}
+        </span>
+        <ChevronDown className={`w-3.5 h-3.5 text-forest/40 flex-shrink-0 transition-transform duration-200 ${open ? "rotate-180" : ""}`} />
+      </button>
 
-    case "mobile": {
-      if (!value.trim()) return {};
-      if (!ctx.dialCountry) return { warning: "Select a country code to validate" };
-      try {
-        if (!isValidPhoneNumber(value, ctx.dialCountry as CountryCode))
-          return { error: "Invalid number for the selected country" };
-        const p = parsePhoneNumber(value, ctx.dialCountry as CountryCode);
-        return { success: `Valid · ${p.formatInternational()}` };
-      } catch {
-        return { error: "Could not parse — check the format" };
-      }
-    }
-
-    case "companyName":
-      if (!value.trim()) return { error: "Company name is required" };
-      if (value.trim().length < 2) return { error: "At least 2 characters" };
-      return { success: "Looks good" };
-
-    case "sector":
-      if (!value) return { error: "Please select an industry" };
-      return {};
-
-    case "websiteUrl":
-      if (!value.trim()) return { warning: "A website builds credibility with reviewers" };
-      if (!/^https?:\/\/.+\..+/.test(value.trim()))
-        return { error: "Must start with https:// — e.g. https://yoursite.com" };
-      if (!value.trim().startsWith("https://"))
-        return { warning: "Consider using https:// for security" };
-      return { success: "Valid URL" };
-
-    case "country":
-      if (!value.trim()) return { warning: "Helps us match regional investors" };
-      return {};
-
-    case "impactDescription":
-      if (!value.trim()) return { warning: "Describe your impact — reviewed 2× faster" };
-      if (value.trim().length < 30) return { warning: "A bit more detail helps reviewers" };
-      return { success: "Great — adds real depth to your application" };
-
-    case "capitalRequested":
-      if (!value.trim()) return { warning: "Specifying an amount helps investors assess fit" };
-      return {};
-
-    case "fundingPeriod":
-      if (!value.trim()) return { warning: "Let investors know your expected runway" };
-      return {};
-
-    case "useOfFunds":
-      if (!value.trim()) return { warning: "A brief breakdown increases reviewer confidence" };
-      return {};
-
-    case "pitchDeckUrl":
-      if (!value.trim()) return { warning: "Applications with a pitch deck are 3× more likely to advance" };
-      if (!/^https?:\/\/.+\..+/.test(value.trim()))
-        return { error: "Must start with https://" };
-      return { success: "Link looks valid" };
-
-    default:
-      return {};
-  }
+      {open && (
+        <div className="absolute left-0 top-full mt-1.5 w-full bg-white border border-forest/12 rounded-xl shadow-2xl z-[100] overflow-hidden">
+          <ul className="overflow-y-auto max-h-64 py-1.5">
+            {industryOptions.map(o => (
+              <li
+                key={o.value}
+                onClick={() => { onChange(o.value); setOpen(false); }}
+                className={`flex items-center justify-between px-4 py-2.5 text-sm cursor-pointer transition-colors ${
+                  value === o.value
+                    ? "bg-forest text-white font-medium"
+                    : "text-forest hover:bg-beige/60"
+                }`}
+              >
+                <span>{o.label}</span>
+                {value === o.value && (
+                  <CheckCircle className="w-3.5 h-3.5 text-white/70 flex-shrink-0" />
+                )}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
 }
 
-// ─── Phone country dropdown ───────────────────────────────────────────────────
+// ─── Phone country dropdown ────────────────────────────────────────────────────
 
 function PhoneCountryDropdown({
   value, onChange, countries, loading,
@@ -312,7 +411,7 @@ function PhoneCountryDropdown({
       const el = listRef.current.children[idx + 1] as HTMLElement;
       el?.scrollIntoView({ block: "nearest" });
     }
-  }, [open]);
+  }, [open, value, filtered]);
 
   function onTriggerKey(e: React.KeyboardEvent) {
     if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setOpen(true); return; }
@@ -327,13 +426,13 @@ function PhoneCountryDropdown({
   }
 
   return (
-    <div className="relative flex-shrink-0" ref={ref}>
+    <div className="relative" ref={ref}>
       <button
         type="button"
         onClick={() => setOpen(o => !o)}
         onKeyDown={onTriggerKey}
         disabled={loading}
-        className="input-field flex items-center gap-2 pr-8 min-w-[130px] cursor-pointer select-none"
+        className="input-field w-full flex items-center gap-2 pr-8 cursor-pointer select-none"
         style={{ fontSize: 13 }}
         aria-haspopup="listbox"
         aria-expanded={open}
@@ -343,11 +442,13 @@ function PhoneCountryDropdown({
           : selected
             ? (
               <>
-                {/* ── FLAG FIXED: img instead of emoji span ── */}
-                <img
+                <Image
                   src={selected.flag}
                   alt={selected.name}
-                  className="w-5 h-3.5 object-cover rounded-sm flex-shrink-0"
+                  width={20}
+                  height={14}
+                  style={{ width: 20, height: 14 }}
+                  className="object-cover rounded-sm flex-shrink-0"
                 />
                 <span className="font-medium text-forest/70">{selected.dial}</span>
               </>
@@ -394,18 +495,20 @@ function PhoneCountryDropdown({
                 }`}
                 onClick={() => { onChange(c.code); setOpen(false); setSearch(""); }}
               >
-                {/* ── FLAG FIXED: img instead of emoji span ── */}
-                <img
+                <Image
                   src={c.flag}
                   alt={c.name}
-                  className="w-5 h-3.5 object-cover rounded-sm flex-shrink-0"
+                  width={20}
+                  height={14}
+                  style={{ width: 20, height: 14 }}
+                  className="object-cover rounded-sm flex-shrink-0"
                 />
                 <span className="flex-1 truncate">{c.name}</span>
                 <span className={`text-xs tabular-nums font-medium ${value === c.code ? "text-white/70" : "text-forest/40"}`}>{c.dial}</span>
               </li>
             ))}
             {filtered.length === 0 && (
-              <li className="px-4 py-4 text-sm text-forest/40 text-center">No results for "{search}"</li>
+              <li className="px-4 py-4 text-sm text-forest/40 text-center">No results for &quot;{search}&quot;</li>
             )}
           </ul>
         </div>
@@ -414,7 +517,34 @@ function PhoneCountryDropdown({
   );
 }
 
-// ─── Currency + Amount input ──────────────────────────────────────────────────
+// ─── Currency + Amount input ───────────────────────────────────────────────────
+
+const MAX_CAPITAL_BY_CURRENCY: Record<string, number> = {
+  INR: 990_000_000,
+  USD: 100_000_000,
+  EUR: 100_000_000,
+  GBP: 100_000_000,
+  DEFAULT: 999_999_999,
+};
+
+function formatAmount(raw: string, currencyCode: string): string {
+  const digits = raw.replace(/[^\d]/g, "");
+  if (!digits) return "";
+  const num = parseInt(digits, 10);
+  if (isNaN(num)) return "";
+  const max = MAX_CAPITAL_BY_CURRENCY[currencyCode] ?? MAX_CAPITAL_BY_CURRENCY.DEFAULT;
+  const clamped = Math.min(num, max);
+
+  if (currencyCode === "INR") {
+    const s = clamped.toString();
+    if (s.length <= 3) return s;
+    const last3 = s.slice(-3);
+    const rest = s.slice(0, -3);
+    return rest.replace(/\B(?=(\d{2})+(?!\d))/g, ",") + "," + last3;
+  }
+
+  return clamped.toLocaleString("en-US");
+}
 
 function CapitalInput({
   amount, currency, onAmountChange, onCurrencyChange, hasWarning,
@@ -444,6 +574,17 @@ function CapitalInput({
     document.addEventListener("mousedown", h);
     return () => document.removeEventListener("mousedown", h);
   }, []);
+
+  function handleAmountChange(raw: string) {
+    onAmountChange(formatAmount(raw, currency));
+  }
+
+  function handleCurrencyChange(code: string) {
+    onCurrencyChange(code);
+    if (amount) onAmountChange(formatAmount(amount, code));
+  }
+
+  const maxLabel = currency === "INR" ? "Max ₹99 Crore" : "Max 100M";
 
   return (
     <div className={`flex border rounded-lg transition-colors bg-white ${hasWarning ? "border-amber-300" : "border-forest/15"}`}>
@@ -479,7 +620,7 @@ function CapitalInput({
                   className={`flex items-center gap-2.5 px-3 py-2 text-sm cursor-pointer transition-colors ${
                     currency === c.code ? "bg-forest text-white" : "text-forest hover:bg-beige/60"
                   }`}
-                  onClick={() => { onCurrencyChange(c.code); setOpen(false); setSearch(""); }}
+                  onClick={() => { handleCurrencyChange(c.code); setOpen(false); setSearch(""); }}
                 >
                   <span className={`w-8 font-bold text-[15px] ${currency === c.code ? "text-white" : "text-forest/60"}`}>{c.symbol}</span>
                   <span className="flex-1 truncate">{c.name}</span>
@@ -498,16 +639,16 @@ function CapitalInput({
         type="text"
         inputMode="numeric"
         className="flex-1 px-3 py-2.5 text-sm text-forest bg-transparent outline-none placeholder-forest/30 min-w-0"
-        placeholder="500,000"
+        placeholder={currency === "INR" ? "50,00,000" : "500,000"}
         value={amount}
-        maxLength={CHAR_LIMITS.capitalRequested}
-        onChange={e => onAmountChange(e.target.value.replace(/[^\d.,]/g, "").slice(0, CHAR_LIMITS.capitalRequested))}
+        onChange={e => handleAmountChange(e.target.value)}
       />
+      <span className="flex-shrink-0 self-center pr-3 text-[10px] text-forest/30 whitespace-nowrap">{maxLabel}</span>
     </div>
   );
 }
 
-// ─── Period picker ────────────────────────────────────────────────────────────
+// ─── Period picker ─────────────────────────────────────────────────────────────
 
 function PeriodInput({
   value, unit, onValueChange, onUnitChange, hasWarning,
@@ -546,13 +687,15 @@ function PeriodInput({
   );
 }
 
-// ─── Main Page ────────────────────────────────────────────────────────────────
+// ─── Main Page ─────────────────────────────────────────────────────────────────
 
 export default function ApplyPage() {
   const router = useRouter();
   const [currentStep, setCurrentStep] = useState(0);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
+  const [emailWarning, setEmailWarning] = useState<string | null>(null);
+  const [stepBlocked, setStepBlocked] = useState<string | null>(null);
 
   const [errs,  setErrs]  = useState<Record<string, string>>({});
   const [warns, setWarns] = useState<Record<string, string>>({});
@@ -573,13 +716,14 @@ export default function ApplyPage() {
   const [form, setForm] = useState({
     founderName: "", email: "", mobile: "",
     companyName: "", sector: "",
-    stage: "Seed / Early" as typeof stages[number],
+    stage: "Seed / Early" as StageLabel,
     country: "", websiteUrl: "",
     impactDescription: "", impactMetrics: "",
     capitalRequested: "", fundingPeriod: "", useOfFunds: "",
     pitchDeckUrl: "",
   });
 
+  // ── Load countries ──────────────────────────────────────────────────────────
   useEffect(() => {
     fetch("/api/countries")
       .then(r => r.ok ? r.json() : Promise.reject())
@@ -590,19 +734,48 @@ export default function ApplyPage() {
 
   useEffect(() => { setIsClient(true); }, []);
 
+  // ── Restore draft from sessionStorage ──────────────────────────────────────
   useEffect(() => {
     try {
-      const saved = localStorage.getItem("venturehub-application-draft");
+      const saved =
+        sessionStorage.getItem("venturehub-draft") ??
+        localStorage.getItem("venturehub-draft");
       if (!saved) return;
       const p = JSON.parse(saved);
-      setForm(prev => ({ ...prev, ...p }));
-      if (p.dialCountry) setDialCountry(p.dialCountry);
-      if (p.capitalCurrency) setCapitalCurrency(p.capitalCurrency);
-      if (p.periodUnit) setPeriodUnit(p.periodUnit);
-      if (p.periodValue) setPeriodValue(p.periodValue);
+
+      setForm(prev => ({
+        ...prev,
+        companyName:       typeof p.companyName       === "string" ? p.companyName       : prev.companyName,
+        sector:            typeof p.sector             === "string" ? p.sector             : prev.sector,
+        stage:             (typeof p.stage === "string" && p.stage in stageMapping)
+                            ? p.stage as StageLabel
+                            : prev.stage,
+        websiteUrl:        typeof p.websiteUrl         === "string" ? p.websiteUrl         : prev.websiteUrl,
+        impactDescription: typeof p.impactDescription  === "string" ? p.impactDescription  : prev.impactDescription,
+        impactMetrics:     typeof p.impactMetrics       === "string" ? p.impactMetrics       : prev.impactMetrics,
+        useOfFunds:        typeof p.useOfFunds          === "string" ? p.useOfFunds          : prev.useOfFunds,
+        country:           typeof p.country             === "string" ? p.country             : prev.country,
+        pitchDeckUrl:      typeof p.pitchDeckUrl        === "string" ? p.pitchDeckUrl        : prev.pitchDeckUrl,
+        capitalRequested:  typeof p.capitalRequested    === "string" ? p.capitalRequested    : prev.capitalRequested,
+        fundingPeriod:     typeof p.fundingPeriod       === "string" ? p.fundingPeriod       : prev.fundingPeriod,
+      }));
+
+      if (typeof p.dialCountry === "string" && p.dialCountry)
+        setDialCountry(p.dialCountry);
+
+      if (typeof p.capitalCurrency === "string" && VALID_CURRENCY_CODES.has(p.capitalCurrency))
+        setCapitalCurrency(p.capitalCurrency);
+
+      if (typeof p.periodUnit === "string" && (PERIOD_UNITS as readonly string[]).includes(p.periodUnit))
+        setPeriodUnit(p.periodUnit as PeriodUnit);
+
+      if (typeof p.periodValue === "string")
+        setPeriodValue(p.periodValue);
+
     } catch {}
   }, []);
 
+  // ── Auto-detect country from timezone ──────────────────────────────────────
   useEffect(() => {
     if (!isClient || countriesLoading || !countries.length || dialCountry) return;
     try {
@@ -616,39 +789,38 @@ export default function ApplyPage() {
       setCapitalCurrency(found.currency || "USD");
       setCountryAutoFilled(true);
     } catch {}
-  }, [isClient, countriesLoading, countries]);
+  }, [isClient, countriesLoading, countries, dialCountry]);
 
+  // ── Keep fundingPeriod in sync with periodValue + periodUnit ───────────────
   useEffect(() => {
     const combined = periodValue ? `${periodValue} ${periodUnit}` : "";
     setForm(prev => ({ ...prev, fundingPeriod: combined }));
     applyResult("fundingPeriod", validate("fundingPeriod", combined));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [periodValue, periodUnit]);
+
+  // ── Run initial validation for current step whenever step changes ───────────
+  useEffect(() => {
+    setStepBlocked(null);
+    const fields = STEP_FIELDS[currentStep] ?? [];
+    fields.forEach(id => {
+      const v = (form as Record<string, string>)[id] ?? "";
+      applyResult(id, validate(id, v, { dialCountry }));
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentStep]);
 
   useEffect(() => {
     document.body.style.overflow = showMobileMenu ? "hidden" : "unset";
     return () => { document.body.style.overflow = "unset"; };
   }, [showMobileMenu]);
 
-function applyResult(id: string, r: VResult) {
-  setErrs(p => {
-    const n = { ...p };
-    if (r.error) n[id] = r.error;
-    else delete n[id];
-    return n;
-  });
-  setWarns(p => {
-    const n = { ...p };
-    if (r.warning) n[id] = r.warning;
-    else delete n[id];
-    return n;
-  });
-  setOks(p => {
-    const n = { ...p };
-    if (r.success) n[id] = r.success;
-    else delete n[id];
-    return n;
-  });
-}
+  function applyResult(id: string, r: VResult) {
+    setErrs(p => { const n = { ...p }; if (r.error) n[id] = r.error; else delete n[id]; return n; });
+    setWarns(p => { const n = { ...p }; if (r.warning) n[id] = r.warning; else delete n[id]; return n; });
+    setOks(p => { const n = { ...p }; if (r.success) n[id] = r.success; else delete n[id]; return n; });
+  }
+
   function fieldCls(id: string) {
     if (errs[id])  return "border-red-300 bg-red-50/30";
     if (warns[id]) return "border-amber-300 bg-amber-50/20";
@@ -656,17 +828,24 @@ function applyResult(id: string, r: VResult) {
     return "";
   }
 
+  // ── Real-time validation on every keystroke ────────────────────────────────
   function handleChange(e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>) {
     const { id, value } = e.target;
-    const limit = CHAR_LIMITS[id];
+
+    if (id === "mobile" && /[^0-9\s\-()+]/.test(value)) return;
+
+    const limit = CHAR_LIMITS[id as keyof typeof CHAR_LIMITS];
     const v = limit ? value.slice(0, limit) : value;
     setForm(prev => ({ ...prev, [id]: v }));
     setSubmitError(null);
+    setStepBlocked(null);
+
     applyResult(id, validate(id, v, { dialCountry }));
   }
 
   function handleDialChange(cc: string) {
     setDialCountry(cc);
+    setStepBlocked(null);
     if (cc) {
       const found = countries.find(c => c.code === cc);
       if (found) {
@@ -683,14 +862,6 @@ function applyResult(id: string, r: VResult) {
     }
   }
 
-  const STEP_FIELDS: Record<number, string[]> = {
-    0: ["founderName", "email", "mobile"],
-    1: ["companyName", "sector", "websiteUrl", "country"],
-    2: ["impactDescription"],
-    3: ["capitalRequested", "fundingPeriod", "useOfFunds"],
-    4: ["pitchDeckUrl"],
-  };
-
   function validateStep(step: number): boolean {
     let ok = true;
     for (const id of (STEP_FIELDS[step] ?? [])) {
@@ -698,6 +869,11 @@ function applyResult(id: string, r: VResult) {
       const r = validate(id, v, { dialCountry });
       applyResult(id, r);
       if (r.error) ok = false;
+    }
+    // Also fail if any required field is empty
+    for (const id of (REQUIRED_FIELDS[step] ?? [])) {
+      const v = (form as Record<string, string>)[id] ?? "";
+      if (!v.trim()) ok = false;
     }
     return ok;
   }
@@ -716,21 +892,71 @@ function applyResult(id: string, r: VResult) {
   }
 
   const saveDraft = () => {
-    localStorage.setItem("venturehub-application-draft", JSON.stringify({
-      ...form, dialCountry, capitalCurrency, periodUnit, periodValue,
-    }));
+    try {
+      const payload = {
+        companyName:       form.companyName,
+        sector:            form.sector,
+        stage:             form.stage,
+        websiteUrl:        form.websiteUrl,
+        impactDescription: form.impactDescription,
+        impactMetrics:     form.impactMetrics,
+        useOfFunds:        form.useOfFunds,
+        country:           form.country,
+        pitchDeckUrl:      form.pitchDeckUrl,
+        capitalRequested:  form.capitalRequested,
+        fundingPeriod:     form.fundingPeriod,
+        dialCountry,
+        capitalCurrency,
+        periodUnit,
+        periodValue,
+      };
+      const serialized = JSON.stringify(payload);
+      sessionStorage.setItem("venturehub-draft", serialized);
+      localStorage.setItem("venturehub-draft", serialized);
+    } catch {}
   };
 
   const handleNext = () => {
-    if (validateStep(currentStep)) {
-      saveDraft();
-      setCurrentStep(p => p + 1);
-      window.scrollTo({ top: 0, behavior: "smooth" });
+    // Trigger validation UI on all fields in this step first
+    for (const id of (STEP_FIELDS[currentStep] ?? [])) {
+      const v = (form as Record<string, string>)[id] ?? "";
+      applyResult(id, validate(id, v, { dialCountry }));
     }
+
+    // Check for empty required fields
+    const required = REQUIRED_FIELDS[currentStep] ?? [];
+    const emptyFields = required.filter(
+      id => !(form as Record<string, string>)[id]?.trim()
+    );
+
+    if (emptyFields.length > 0) {
+      const names = emptyFields
+        .map(f => REQUIRED_FIELD_LABELS[f] ?? f)
+        .join(", ");
+      setStepBlocked(`Please fill in the required fields before continuing: ${names}.`);
+      return;
+    }
+
+    // Check for hard validation errors
+    const hasErrors = (STEP_FIELDS[currentStep] ?? []).some(id => {
+      const v = (form as Record<string, string>)[id] ?? "";
+      return validate(id, v, { dialCountry }).error;
+    });
+
+    if (hasErrors) {
+      setStepBlocked("Please fix the errors above before continuing.");
+      return;
+    }
+
+    setStepBlocked(null);
+    saveDraft();
+    setCurrentStep(p => p + 1);
+    window.scrollTo({ top: 0, behavior: "smooth" });
   };
 
   const handlePrevious = () => {
     if (currentStep > 0) {
+      setStepBlocked(null);
       setCurrentStep(p => p - 1);
       window.scrollTo({ top: 0, behavior: "smooth" });
     }
@@ -738,6 +964,7 @@ function applyResult(id: string, r: VResult) {
 
   const handleStepClick = (i: number) => {
     if (i <= currentStep || validateStep(currentStep)) {
+      setStepBlocked(null);
       setCurrentStep(i);
       setShowMobileMenu(false);
       window.scrollTo({ top: 0, behavior: "smooth" });
@@ -760,14 +987,24 @@ function applyResult(id: string, r: VResult) {
     }
     setIsSubmitting(true);
     setSubmitError(null);
-    try {
-      localStorage.setItem("application-email", form.email);
+    setEmailWarning(null);
 
+    try {
       let formattedPhone: string | undefined;
       if (form.mobile.trim() && dialCountry) {
         try {
           formattedPhone = parsePhoneNumber(form.mobile, dialCountry as CountryCode).formatInternational();
-        } catch { formattedPhone = form.mobile; }
+        } catch {
+          formattedPhone = form.mobile;
+        }
+      }
+
+      const safeCurrency = VALID_CURRENCY_CODES.has(capitalCurrency) ? capitalCurrency : "USD";
+      const rawCapital = form.capitalRequested || undefined;
+
+      const mappedStage = stageMapping[form.stage];
+      if (!mappedStage) {
+        throw new Error("Invalid stage selected. Please go back to Step 2 and reselect.");
       }
 
       const response = await fetch("/api/apply", {
@@ -776,31 +1013,52 @@ function applyResult(id: string, r: VResult) {
         body: JSON.stringify({
           founderName:       form.founderName,
           email:             form.email,
-          mobile:            formattedPhone,
+          mobile:            formattedPhone || undefined,
           companyName:       form.companyName,
           sector:            form.sector,
-          stage:             stageMapping[form.stage as keyof typeof stageMapping],
-          country:           form.country   || undefined,
-          websiteUrl:        form.websiteUrl || undefined,
-          pitchDeckUrl:      form.pitchDeckUrl || undefined,
+          stage:             mappedStage,
+          country:           form.country           || undefined,
+          websiteUrl:        form.websiteUrl        || undefined,
+          pitchDeckUrl:      form.pitchDeckUrl      || undefined,
           impactDescription: form.impactDescription || undefined,
-          impactMetrics:     form.impactMetrics     || undefined,
-          useOfFunds:        form.useOfFunds        || undefined,
-          fundingPeriod:     form.fundingPeriod     || undefined,
-          capitalRequested:  form.capitalRequested ? `${capitalCurrency} ${form.capitalRequested}` : undefined,
-          capitalCurrency,
+          impactMetrics:     form.impactMetrics      || undefined,
+          useOfFunds:        form.useOfFunds         || undefined,
+          fundingPeriod:     form.fundingPeriod      || undefined,
+          capitalRequested:  rawCapital,
+          capitalCurrency:   safeCurrency,
         }),
       });
 
       const data = await response.json();
+
       if (!response.ok) {
-        if (response.status === 409) throw new Error("An application with this email already exists.");
-        if (response.status === 400 && data.details) throw new Error(data.details.map((d: { message: string }) => d.message).join(". "));
+        if (response.status === 429) {
+          throw new Error("Too many requests. Please wait a moment and try again.");
+        }
+        if (response.status === 409) {
+          throw new Error("An application with this email already exists.");
+        }
+        if (response.status === 400) {
+          if (data.details && Array.isArray(data.details)) {
+            const msgs = data.details
+              .map((d: { field: string; message: string }) =>
+                d.field ? `${d.field}: ${d.message}` : d.message
+              )
+              .join("\n");
+            throw new Error(msgs);
+          }
+          throw new Error(data.error || "Validation failed — please check all fields.");
+        }
         throw new Error(data.error || "Something went wrong. Please try again.");
       }
 
-      localStorage.removeItem("venturehub-application-draft");
+      try {
+        sessionStorage.removeItem("venturehub-draft");
+        localStorage.removeItem("venturehub-draft");
+      } catch {}
+      if (data.emailWarning) setEmailWarning(data.emailWarning);
       router.push("/startups/success");
+
     } catch (err) {
       setSubmitError(err instanceof Error ? err.message : "Something went wrong");
     } finally {
@@ -821,7 +1079,6 @@ function applyResult(id: string, r: VResult) {
     );
   }
 
-  // Helper: get selected country object
   const selectedCountry = countries.find(c => c.code === dialCountry);
 
   return (
@@ -888,14 +1145,21 @@ function applyResult(id: string, r: VResult) {
                     <AlertCircle className="w-4 h-4 text-red-500 flex-shrink-0 mt-0.5" />
                     <div>
                       <p className="text-red-700 text-sm font-medium">Submission failed</p>
-                      <p className="text-red-600 text-xs mt-0.5">{submitError}</p>
+                      <p className="text-red-600 text-xs mt-0.5 whitespace-pre-line">{submitError}</p>
                     </div>
+                  </div>
+                )}
+
+                {emailWarning && (
+                  <div className="mx-4 sm:mx-8 mt-6 p-4 bg-amber-50 border border-amber-200 rounded-xl flex items-start gap-3">
+                    <AlertCircle className="w-4 h-4 text-amber-500 flex-shrink-0 mt-0.5" />
+                    <p className="text-amber-700 text-xs">{emailWarning}</p>
                   </div>
                 )}
 
                 <form className="p-4 sm:p-8 lg:p-12 space-y-8 lg:space-y-12" onSubmit={e => e.preventDefault()}>
 
-                  {/* ── Step 1 ── */}
+                  {/* ── Step 1: Founder Identity ── */}
                   {currentStep === 0 && (
                     <section className="space-y-5 animate-fade-in">
                       <div>
@@ -912,6 +1176,7 @@ function applyResult(id: string, r: VResult) {
                           className={`input-field ${fieldCls("founderName")}`}
                           placeholder="Elara Vance" value={form.founderName} onChange={handleChange} />
                         <FieldError msg={errs.founderName} />
+                        <FieldWarn  msg={warns.founderName} />
                         <FieldOk   msg={oks.founderName} />
                         <p className="text-[10px] text-forest/30 mt-1">Letters, spaces, hyphens, apostrophes · 2–{CHAR_LIMITS.founderName} chars</p>
                       </div>
@@ -930,12 +1195,27 @@ function applyResult(id: string, r: VResult) {
                         <label className="label-style mb-1 block">
                           Mobile <span className="text-forest/30 font-normal">(optional)</span>
                         </label>
-                        <div className="flex gap-2">
+                        <div className="grid grid-cols-2 gap-2">
                           <PhoneCountryDropdown value={dialCountry} onChange={handleDialChange} countries={countries} loading={countriesLoading} />
-                          <input type="tel" id="mobile" autoComplete="tel-national"
-                            className={`input-field flex-1 ${fieldCls("mobile")}`}
-                            placeholder={dialCountry === "IN" ? "98765 43210" : dialCountry === "US" ? "(555) 123-4567" : dialCountry === "GB" ? "07700 900123" : "Enter number"}
-                            value={form.mobile} onChange={handleChange} />
+                          <input
+                            type="tel"
+                            id="mobile"
+                            autoComplete="tel-national"
+                            disabled={!dialCountry}
+                            title={!dialCountry ? "Select a country code first" : undefined}
+                            className={`input-field ${fieldCls("mobile")} ${
+                              !dialCountry ? "opacity-40 cursor-not-allowed bg-forest/5" : ""
+                            }`}
+                            placeholder={
+                              !dialCountry        ? "Select a country code first"
+                              : dialCountry === "IN" ? "98765 43210"
+                              : dialCountry === "US" ? "(555) 123-4567"
+                              : dialCountry === "GB" ? "07700 900123"
+                              : "Enter number"
+                            }
+                            value={form.mobile}
+                            onChange={handleChange}
+                          />
                         </div>
                         <FieldError msg={errs.mobile} />
                         <FieldWarn  msg={warns.mobile} />
@@ -943,11 +1223,13 @@ function applyResult(id: string, r: VResult) {
                         {countryAutoFilled && dialCountry && selectedCountry && (
                           <div className="flex items-center gap-1.5 mt-1.5">
                             <CheckCircle className="w-3 h-3 text-green-600 flex-shrink-0" />
-                            {/* ── FLAG FIXED: img instead of emoji in auto-detect hint ── */}
-                            <img
+                            <Image
                               src={selectedCountry.flag}
                               alt={selectedCountry.name}
-                              className="w-4 h-3 object-cover rounded-sm"
+                              width={16}
+                              height={12}
+                              style={{ width: 16, height: 12 }}
+                              className="object-cover rounded-sm"
                             />
                             <p className="text-[10px] text-forest/50">
                               Auto-detected: <span className="font-medium text-forest/70">{selectedCountry.name}</span>
@@ -959,7 +1241,7 @@ function applyResult(id: string, r: VResult) {
                     </section>
                   )}
 
-                  {/* ── Step 2 ── */}
+                  {/* ── Step 2: Core Concept ── */}
                   {currentStep === 1 && (
                     <section className="space-y-5 animate-fade-in">
                       <div>
@@ -976,17 +1258,24 @@ function applyResult(id: string, r: VResult) {
                           className={`input-field ${fieldCls("companyName")}`}
                           placeholder="Aeris Bio" value={form.companyName} onChange={handleChange} />
                         <FieldError msg={errs.companyName} />
+                        <FieldWarn  msg={warns.companyName} />
                         <FieldOk   msg={oks.companyName} />
                       </div>
 
                       <div>
-                        <label className="label-style" htmlFor="sector">Primary Industry <span className="text-red-400">*</span></label>
-                        <select id="sector" className={`input-field appearance-none cursor-pointer ${fieldCls("sector")}`}
-                          value={form.sector} onChange={handleChange}>
-                          <option value="">Select Industry</option>
-                          {industryOptions.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
-                        </select>
+                        <label className="label-style mb-1 block">Primary Industry <span className="text-red-400">*</span></label>
+                        <IndustryDropdown
+                          value={form.sector}
+                          onChange={v => {
+                            setForm(prev => ({ ...prev, sector: v }));
+                            applyResult("sector", validate("sector", v));
+                            setStepBlocked(null);
+                          }}
+                          hasError={!!errs.sector}
+                          hasWarning={!!warns.sector}
+                        />
                         <FieldError msg={errs.sector} />
+                        <FieldWarn  msg={warns.sector} />
                       </div>
 
                       <div>
@@ -994,7 +1283,9 @@ function applyResult(id: string, r: VResult) {
                         <div className="flex flex-wrap gap-2 mt-2">
                           {stages.map(s => (
                             <label key={s} className={`flex items-center gap-2 px-3 py-2.5 border rounded-lg cursor-pointer transition-all ${form.stage === s ? "bg-forest text-white border-forest shadow-sm" : "bg-beige/50 border-forest/10 hover:bg-beige"}`}>
-                              <input type="radio" name="stage" value={s} checked={form.stage === s} onChange={() => setForm(p => ({ ...p, stage: s }))} className="sr-only" />
+                              <input type="radio" name="stage" value={s} checked={form.stage === s}
+                                onChange={() => setForm(p => ({ ...p, stage: s as StageLabel }))}
+                                className="sr-only" />
                               <span className={`text-xs font-bold uppercase tracking-widest ${form.stage === s ? "text-white" : "text-forest/70"}`}>{s}</span>
                             </label>
                           ))}
@@ -1034,7 +1325,7 @@ function applyResult(id: string, r: VResult) {
                     </section>
                   )}
 
-                  {/* ── Step 3 ── */}
+                  {/* ── Step 3: Impact Resonance ── */}
                   {currentStep === 2 && (
                     <section className="space-y-5 animate-fade-in">
                       <div>
@@ -1069,7 +1360,7 @@ function applyResult(id: string, r: VResult) {
                     </section>
                   )}
 
-                  {/* ── Step 4 ── */}
+                  {/* ── Step 4: Capital Needs ── */}
                   {currentStep === 3 && (
                     <section className="space-y-5 animate-fade-in">
                       <div>
@@ -1087,13 +1378,13 @@ function applyResult(id: string, r: VResult) {
                               setForm(p => ({ ...p, capitalRequested: v }));
                               applyResult("capitalRequested", validate("capitalRequested", v));
                             }}
-                            onCurrencyChange={code => setCapitalCurrency(code)}
+                            onCurrencyChange={code => {
+                              if (VALID_CURRENCY_CODES.has(code)) setCapitalCurrency(code);
+                            }}
                             hasWarning={!!warns.capitalRequested}
                           />
                           <FieldWarn msg={warns.capitalRequested} />
-                          <p className="text-[10px] text-forest/30 mt-1">
-                            Currency auto-set from region · change freely · <span className="font-medium text-forest/50">saved in DB with application</span>
-                          </p>
+                          <p className="text-[10px] text-forest/30 mt-1">Currency auto-set from region · change freely</p>
                         </div>
 
                         <div>
@@ -1126,7 +1417,7 @@ function applyResult(id: string, r: VResult) {
                     </section>
                   )}
 
-                  {/* ── Step 5 ── */}
+                  {/* ── Step 5: The Collective ── */}
                   {currentStep === 4 && (
                     <section className="space-y-5 animate-fade-in">
                       <div>
@@ -1151,31 +1442,45 @@ function applyResult(id: string, r: VResult) {
                     </section>
                   )}
 
-                  {/* Nav row */}
+                  {/* ── Navigation row ── */}
                   <div className="pt-6 border-t border-forest/10 flex items-center justify-between gap-3">
                     <button type="button" onClick={handleSaveProgress}
                       className="text-xs font-bold uppercase tracking-widest text-forest/40 hover:text-forest transition-colors flex items-center gap-1.5 py-2 flex-shrink-0">
                       <Save className="w-3.5 h-3.5" />
                       <span className="hidden sm:inline">Save</span>
                     </button>
-                    <div className="flex gap-2">
-                      {currentStep > 0 && (
-                        <button type="button" onClick={handlePrevious}
-                          className="flex items-center gap-1.5 px-4 py-3 border border-forest/20 text-forest font-bold uppercase text-xs tracking-[0.15em] hover:bg-beige transition-colors rounded-lg">
-                          <ChevronLeft className="w-3.5 h-3.5" />Back
-                        </button>
+
+                    <div className="flex flex-col items-end gap-2">
+                      {/* ── Blocked warning banner ── */}
+                      {stepBlocked && (
+                        <div className="flex items-center gap-2 px-3 py-2 bg-red-50 border border-red-200 rounded-lg animate-fade-in">
+                          <AlertCircle className="w-3.5 h-3.5 text-red-500 flex-shrink-0" />
+                          <p className="text-red-600 text-xs font-medium leading-tight">{stepBlocked}</p>
+                        </div>
                       )}
-                      {currentStep < steps.length - 1 ? (
-                        <button type="button" onClick={handleNext}
-                          className="flex items-center gap-1.5 px-6 py-3 bg-forest text-white font-bold uppercase text-xs tracking-[0.15em] hover:bg-forest/90 transition-colors rounded-lg shadow-sm shadow-forest/10">
-                          Continue<ChevronRight className="w-3.5 h-3.5" />
-                        </button>
-                      ) : (
-                        <button type="button" onClick={handleSubmit} disabled={isSubmitting}
-                          className="flex items-center gap-2 px-6 py-3 bg-forest text-white font-bold uppercase text-xs tracking-[0.15em] hover:bg-forest/90 transition-colors disabled:opacity-50 disabled:cursor-not-allowed rounded-lg shadow-sm shadow-forest/10">
-                          {isSubmitting ? <><Loader2 className="w-3.5 h-3.5 animate-spin" />Submitting…</> : "Submit Application"}
-                        </button>
-                      )}
+
+                      <div className="flex gap-2">
+                        {currentStep > 0 && (
+                          <button type="button" onClick={handlePrevious}
+                            className="flex items-center gap-1.5 px-4 py-3 border border-forest/20 text-forest font-bold uppercase text-xs tracking-[0.15em] hover:bg-beige transition-colors rounded-lg">
+                            <ChevronLeft className="w-3.5 h-3.5" />Back
+                          </button>
+                        )}
+                        {currentStep < steps.length - 1 ? (
+                          <button type="button" onClick={handleNext}
+                            className="flex items-center gap-1.5 px-6 py-3 bg-forest text-white font-bold uppercase text-xs tracking-[0.15em] hover:bg-forest/90 transition-colors rounded-lg shadow-sm shadow-forest/10">
+                            Continue<ChevronRight className="w-3.5 h-3.5" />
+                          </button>
+                        ) : (
+                          <button type="button" onClick={handleSubmit} disabled={isSubmitting}
+                            className="flex items-center gap-2 px-6 py-3 bg-forest text-white font-bold uppercase text-xs tracking-[0.15em] hover:bg-forest/90 transition-colors disabled:opacity-50 disabled:cursor-not-allowed rounded-lg shadow-sm shadow-forest/10">
+                            {isSubmitting
+                              ? <><Loader2 className="w-3.5 h-3.5 animate-spin" />Submitting…</>
+                              : "Submit Application"
+                            }
+                          </button>
+                        )}
+                      </div>
                     </div>
                   </div>
                 </form>
@@ -1197,8 +1502,8 @@ function applyResult(id: string, r: VResult) {
             </div>
             <div className="p-3 overflow-y-auto">
               {steps.map((step, index) => {
-                const done = index < currentStep;
-                const curr = index === currentStep;
+                const done  = index < currentStep;
+                const curr  = index === currentStep;
                 const avail = index <= currentStep;
                 return (
                   <button key={step.num} onClick={() => avail && handleStepClick(index)} disabled={!avail}

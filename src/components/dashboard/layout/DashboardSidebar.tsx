@@ -155,13 +155,13 @@ const NAV_ITEMS: NavItem[] = [
     roles: ["ADMIN"],
     group: "admin",
   },
-  {
-    href: "/dashboard/admin/investors",
-    label: "Investors",
-    icon: <Briefcase className="h-4 w-4" />,
-    roles: ["ADMIN"],
-    group: "admin",
-  },
+  // {
+  //   href: "/dashboard/admin/investors",
+  //   label: "Investors",
+  //   icon: <Briefcase className="h-4 w-4" />,
+  //   roles: ["ADMIN"],
+  //   group: "admin",
+  // },
   {
     href: "/dashboard/admin/mentors",
     label: "Mentors",
@@ -227,7 +227,7 @@ const ROLE_META: Record<
   INVESTOR: {
     title: "Investor Dashboard",
     description: "Discover startups. Manage your pipeline.",
-    accent: "from-[#1A362B] to-blue-700",
+    accent: "from-[#1A362B] to-[#2D5A47]",
     icon: <Briefcase className="h-3.5 w-3.5" />,
   },
   MENTOR: {
@@ -273,10 +273,10 @@ export default function DashboardSidebar({
     <aside
       className={cn(
         "w-64 bg-card border-r border-border flex flex-col",
-        // Desktop: always visible, full height
-        "hidden lg:flex lg:min-h-[calc(100vh-4rem)]",
+        // Desktop: sticky, stays fixed while content scrolls
+        "hidden lg:flex lg:sticky lg:top-16 lg:h-[calc(100vh-4rem)]",
         // Mobile: fixed overlay
-        "lg:relative lg:translate-x-0 lg:shadow-none"
+        "lg:shadow-none"
       )}
     >
       <SidebarInner

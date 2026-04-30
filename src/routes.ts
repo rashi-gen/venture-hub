@@ -11,11 +11,11 @@ export const publicRoutes: string[] = [
   "/",
   "/auth/verify-email",
   "/investors",
-  "/investors/success",
   "/startups",
   "/startups/success",
   "/cohort",
   "/mentorship",
+  "/mentorship/success",
   "/profile",
   "",
 ];
@@ -23,8 +23,9 @@ export const publicRoutes: string[] = [
 // APIs which are accessible to all.
 export const publicApis: string[] = [
   "/api/apply",
-  "/api/investors/apply",
-  "/api/countries"
+  "/api/investors/create",
+  "/api/countries",
+  "/api/mentor/apply",
 ];
 
 // Routes which are used for authentication.
